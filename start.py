@@ -8,14 +8,14 @@ import asyncio
 import os
 
 # Release version for this deploy. This is intentionally set here so the deployed process reports the same version.
-os.environ["JAVIS_VERSION"] = "1.0.5"
+os.environ["JAVIS_VERSION"] = "1.0.6"
 
 # Preserve the memory-oriented runtime configuration before bot.py imports Argos.
 os.environ.setdefault("ARGOS_DEVICE_TYPE", "cpu")
 os.environ.setdefault("ARGOS_COMPUTE_TYPE", "int8")
 os.environ.setdefault("ARGOS_INTER_THREADS", "1")
 os.environ.setdefault("ARGOS_INTRA_THREADS", "1")
-os.environ.setdefault("ARGOS_BATCH_SIZE", "8")
+os.environ.setdefault("ARGOS_BATCH_SIZE", "1")
 os.environ.setdefault("ARGOS_BEAM_SIZE", "2")
 os.environ["ARGOS_CHUNK_TYPE"] = "MINISBD"
 

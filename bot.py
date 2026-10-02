@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import json
 import logging
 import os
@@ -14,7 +15,7 @@ DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
 
 # Release version for this deploy. Keep this value in sync with the copy-ready filenames.
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.5")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.6")
 
 def get_discord_token() -> str:
     """Read the Discord bot token only from environment variables.
@@ -94,6 +95,33 @@ TWOM_DICTIONARY = load_dictionary()
 # remains lazy-loaded by Argos on first use.
 TRANSLATOR_CACHE: dict[tuple[str, str], object] = {}
 TRANSLATOR_CACHE_LOCK = asyncio.Lock()
+
+
+def release_loaded_argos_resources(translation: object) -> None:
+    """Release the heavy CTranslate2/SBD objects after one translation.
+
+    Render Free provides 512 MB RAM. JAVIS translates one target at a time, so
+    keeping multiple CTranslate2 models resident can exhaust RAM when a single
+    Discord message requires two target languages. Argos keeps the loaded model
+    on PackageTranslation.translator and MiniSBD keeps its detector on
+    sentencizer.detector; clear only those heavy runtime objects so the next
+    target can load without retaining the previous target model.
+    """
+    try:
+        if hasattr(translation, "translator"):
+            translation.translator = None
+    except Exception:
+        log.debug("Could not release Argos translator object", exc_info=True)
+
+    try:
+        sentencizer = getattr(translation, "sentencizer", None)
+        if sentencizer is not None and hasattr(sentencizer, "detector"):
+            sentencizer.detector = None
+    except Exception:
+        log.debug("Could not release MiniSBD detector", exc_info=True)
+
+    # Encourage prompt CPython reference cleanup without adding dependencies.
+    gc.collect()
 
 
 class Protector:
@@ -267,8 +295,13 @@ def translate_sync(text: str, source_lang: str, target_lang: str) -> str:
 
         TRANSLATOR_CACHE[cache_key] = translator
 
-    result = translator.translate(prepared)
-    return restore_twom_terms(result, protector, target_lang)
+    try:
+        result = translator.translate(prepared)
+        return restore_twom_terms(result, protector, target_lang)
+    finally:
+        # Keep only lightweight route metadata cached; never keep the loaded
+        # CTranslate2 model/SBD detector resident between target languages.
+        release_loaded_argos_resources(translator)
 
 
 def translate_all_sync(original: str) -> dict[str, str]:
