@@ -7,7 +7,7 @@ needs those settings. The Discord bot itself remains in bot.py.
 import asyncio
 import os
 
-JAVIS_VERSION = "1.0.11"
+JAVIS_VERSION = "1.0.12"
 os.environ["JAVIS_VERSION"] = JAVIS_VERSION
 
 # Runtime quantization: CTranslate2 models are loaded as INT8 in RAM.

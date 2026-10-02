@@ -16,7 +16,7 @@ from discord.ext import commands
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.11")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.12")
 
 PORT = int(os.getenv("PORT", "10000"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "1200"))
@@ -139,10 +139,47 @@ def strip_language_prefix(text: str) -> str:
     return re.sub(r"^\s*\[(EN|TH|KO)\]\s*", "", text, count=1, flags=re.IGNORECASE)
 
 
+# URLs and emoji are non-translatable content. URLs/custom Discord emoji are
+# protected as tokens when they appear next to normal language text.
+URL_PATTERN = r"(?:https?://|www\.)[^\s<>]+"
+CUSTOM_DISCORD_EMOJI_PATTERN = r"<a?:[A-Za-z0-9_]+:\d+>"
+# Common Unicode emoji blocks plus variation selectors / ZWJ / skin tones.
+UNICODE_EMOJI_PATTERN = (
+    r"(?:[\U0001F1E6-\U0001F1FF]"
+    r"|[\U0001F300-\U0001F5FF]"
+    r"|[\U0001F600-\U0001F64F]"
+    r"|[\U0001F680-\U0001F6FF]"
+    r"|[\U0001F700-\U0001F77F]"
+    r"|[\U0001F780-\U0001F7FF]"
+    r"|[\U0001F800-\U0001F8FF]"
+    r"|[\U0001F900-\U0001F9FF]"
+    r"|[\U0001FA00-\U0001FAFF]"
+    r"|[\u2300-\u23FF]"
+    r"|[\u2600-\u27BF])"
+    r"(?:[\uFE0E\uFE0F]|[\U0001F3FB-\U0001F3FF])?"
+    r"(?:\u200D"
+    r"(?:[\U0001F1E6-\U0001F1FF]|[\U0001F300-\U0001FAFF]|[\u2600-\u27BF])"
+    r"(?:[\uFE0E\uFE0F]|[\U0001F3FB-\U0001F3FF])?)*"
+    r"(?:[0-9#*]\uFE0F?\u20E3)?"
+)
+
+
+def has_translatable_text_after_removing_nontext(text: str) -> bool:
+    """Return True when any normal language text remains."""
+    remaining = re.sub(URL_PATTERN, "", text, flags=re.IGNORECASE)
+    remaining = re.sub(r"<@!?\d+>", "", remaining)
+    remaining = re.sub(CUSTOM_DISCORD_EMOJI_PATTERN, "", remaining)
+    remaining = re.sub(UNICODE_EMOJI_PATTERN, "", remaining)
+    # Remove common zero-width/variation characters left by emoji sequences.
+    remaining = remaining.replace("\u200d", "").replace("\ufe0f", "").replace("\ufe0e", "")
+    return bool(remaining.strip())
+
+
 def protect_common_content(text: str, protector: Protector) -> str:
-    text = protector.protect_regex(text, r"https?://[^\s<>]+", re.IGNORECASE)
+    text = protector.protect_regex(text, URL_PATTERN, re.IGNORECASE)
     text = protector.protect_regex(text, r"<@!?\d+>")
-    text = protector.protect_regex(text, r"<a?:[A-Za-z0-9_]+:\d+>")
+    text = protector.protect_regex(text, CUSTOM_DISCORD_EMOJI_PATTERN)
+    text = protector.protect_regex(text, UNICODE_EMOJI_PATTERN)
     return text
 
 
@@ -789,7 +826,12 @@ async def on_message(message: discord.Message):
         return
     if content.startswith(("/", "$", "?")):
         return
-    if re.fullmatch(r"https?://[^\s]+", content, re.IGNORECASE):
+
+    # Do not translate messages that contain only URLs, Discord/custom emoji,
+    # or Unicode emoji. Normal text mixed with a URL/emoji is still translated,
+    # while the non-translatable pieces remain unchanged.
+    if not has_translatable_text_after_removing_nontext(content):
+        log.info("Skipping non-translatable message | reason=url-or-emoji-only | chars=%d", len(content))
         return
 
     try:
