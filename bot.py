@@ -16,7 +16,7 @@ from discord.ext import commands
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.10")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.11")
 
 PORT = int(os.getenv("PORT", "10000"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "1200"))
@@ -31,8 +31,8 @@ os.environ.setdefault("ARGOS_INTER_THREADS", "1")
 os.environ.setdefault("ARGOS_INTRA_THREADS", "1")
 os.environ.setdefault("ARGOS_BATCH_SIZE", "1")
 os.environ.setdefault("ARGOS_BEAM_SIZE", "2")
-os.environ.setdefault("ARGOS_KO_ENGINE", "argos-native")
-os.environ.setdefault("ARGOS_KO_BEAM_SIZE", "4")
+os.environ["ARGOS_KO_ENGINE"] = "ct2-direct"
+os.environ["ARGOS_KO_BEAM_SIZE"] = "2"
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -256,9 +256,10 @@ def _find_package(source_code, target_code):
     return None
 
 def _translate_korean_native(source_code, target_code, text):
-    # For Korean routes, prefer Argos' packaged translation pipeline. This keeps
-    # the package tokenizer, MiniSBD sentence splitting, target_prefix handling,
-    # replace_unknowns behavior, and Argos decoding configuration together.
+    # Optional Korean native path. v1.0.11 defaults to direct CTranslate2 for
+    # Korean because the previous native path could stall/restart the Render
+    # service before the Discord response was sent. Keep this code path only
+    # as an explicit opt-in via ARGOS_KO_ENGINE=argos-native.
     # The subprocess still exits after one target, so CTranslate2 memory is
     # returned before the next target.
     os.environ["ARGOS_BATCH_SIZE"] = "1"
@@ -745,19 +746,32 @@ async def send_safe_translation(
     message: discord.Message,
     content: str,
 ) -> None:
+    # Use channel.send as the primary path. It is the simplest Discord API
+    # operation for this text-only bot and avoids reply-reference edge cases.
+    # Keep reply() as a fallback so existing channel behavior still works.
     try:
-        await message.reply(
+        log.info("Discord send start | channel=%s | chars=%d", getattr(message.channel, "id", "?"), len(content))
+        await asyncio.wait_for(
+            message.channel.send(
+                content,
+                allowed_mentions=ALLOWED_MENTIONS,
+            ),
+            timeout=20,
+        )
+        log.info("Discord send complete | channel=%s | chars=%d", getattr(message.channel, "id", "?"), len(content))
+        return
+    except (asyncio.TimeoutError, discord.Forbidden, discord.HTTPException):
+        log.exception("Discord channel.send failed; falling back to message.reply")
+
+    await asyncio.wait_for(
+        message.reply(
             content,
             mention_author=False,
             allowed_mentions=ALLOWED_MENTIONS,
-        )
-    except (discord.Forbidden, discord.HTTPException):
-        # Fallback for channels where reply-to-message is unavailable.
-        log.exception("Discord reply failed; falling back to channel.send")
-        await message.channel.send(
-            content,
-            allowed_mentions=ALLOWED_MENTIONS,
-        )
+        ),
+        timeout=20,
+    )
+    log.info("Discord reply fallback complete | channel=%s | chars=%d", getattr(message.channel, "id", "?"), len(content))
 
 
 @bot.event

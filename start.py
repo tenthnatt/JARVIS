@@ -7,7 +7,7 @@ needs those settings. The Discord bot itself remains in bot.py.
 import asyncio
 import os
 
-JAVIS_VERSION = "1.0.10"
+JAVIS_VERSION = "1.0.11"
 os.environ["JAVIS_VERSION"] = JAVIS_VERSION
 
 # Runtime quantization: CTranslate2 models are loaded as INT8 in RAM.
@@ -25,8 +25,8 @@ except ValueError:
     _configured_batch = 1
 os.environ["ARGOS_BATCH_SIZE"] = "1"
 os.environ.setdefault("ARGOS_BEAM_SIZE", "2")
-os.environ.setdefault("ARGOS_KO_ENGINE", "argos-native")
-os.environ.setdefault("ARGOS_KO_BEAM_SIZE", "4")
+os.environ["ARGOS_KO_ENGINE"] = "ct2-direct"
+os.environ["ARGOS_KO_BEAM_SIZE"] = "2"
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
