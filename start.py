@@ -8,7 +8,7 @@ import asyncio
 import os
 
 # Release version for this deploy. This is intentionally set here so the deployed process reports the same version.
-os.environ["JAVIS_VERSION"] = "1.0.3"
+os.environ["JAVIS_VERSION"] = "1.0.4"
 
 # Preserve the memory-oriented runtime configuration before bot.py imports Argos.
 os.environ.setdefault("ARGOS_DEVICE_TYPE", "cpu")
@@ -17,6 +17,7 @@ os.environ.setdefault("ARGOS_INTER_THREADS", "1")
 os.environ.setdefault("ARGOS_INTRA_THREADS", "1")
 os.environ.setdefault("ARGOS_BATCH_SIZE", "8")
 os.environ.setdefault("ARGOS_BEAM_SIZE", "2")
+os.environ.setdefault("ARGOS_CHUNK_TYPE", "NONE")
 
 # Discord token must remain a Render Environment Secret.
 # Accept DISCORD_BOT_TOKEN as a compatibility alias without exposing the token in code.

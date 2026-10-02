@@ -14,7 +14,7 @@ DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
 
 # Release version for this deploy. Keep this value in sync with the copy-ready filenames.
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.3")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.4")
 
 def get_discord_token() -> str:
     """Read the Discord bot token only from environment variables.
@@ -39,6 +39,7 @@ os.environ.setdefault("ARGOS_INTER_THREADS", "1")
 os.environ.setdefault("ARGOS_INTRA_THREADS", "1")
 os.environ.setdefault("ARGOS_BATCH_SIZE", "8")
 os.environ.setdefault("ARGOS_BEAM_SIZE", "2")
+os.environ.setdefault("ARGOS_CHUNK_TYPE", "NONE")
 os.environ.setdefault(
     "ARGOS_PACKAGE_INDEX",
     "https://raw.githubusercontent.com/argosopentech/argospm-index/main",
@@ -87,6 +88,12 @@ def load_dictionary() -> list[dict]:
 
 
 TWOM_DICTIONARY = load_dictionary()
+
+# Cache translation objects so every Discord message does not repeatedly
+# scan all installed Argos languages/packages. The actual CTranslate2 model
+# remains lazy-loaded by Argos on first use.
+TRANSLATOR_CACHE: dict[tuple[str, str], object] = {}
+TRANSLATOR_CACHE_LOCK = asyncio.Lock()
 
 
 class Protector:
@@ -223,7 +230,22 @@ def prepare_for_translation(text: str, source_lang: str, target_lang: str) -> tu
 
 def translate_sync(text: str, source_lang: str, target_lang: str) -> str:
     prepared, protector = prepare_for_translation(text, source_lang, target_lang)
-    result = argos_translate.translate(prepared, source_lang, target_lang)
+
+    # Argos exposes translation objects for installed language pairs. Reusing
+    # the object avoids the repeated get_installed_languages() scan visible in
+    # the failing Render log.
+    cache_key = (source_lang, target_lang)
+    translator = TRANSLATOR_CACHE.get(cache_key)
+    if translator is None:
+        # This function is called from a worker thread, so use a small
+        # thread-safe critical section without blocking the Discord event loop.
+        # Multiple calls are serialized by TRANSLATION_LOCK in on_message.
+        translator = argos_translate.get_translation_from_codes(source_lang, target_lang)
+        if translator is None:
+            raise RuntimeError(f"Argos translation model unavailable: {source_lang}->{target_lang}")
+        TRANSLATOR_CACHE[cache_key] = translator
+
+    result = translator.translate(prepared)
     return restore_twom_terms(result, protector, target_lang)
 
 
@@ -234,28 +256,34 @@ def translate_all_sync(original: str) -> dict[str, str]:
     if not clean:
         return {"source": source_lang, "en": "", "th": "", "ko": ""}
 
-    if source_lang == "en":
-        en_text = clean
-        th_text = translate_sync(clean, "en", "th")
-        ko_text = translate_sync(clean, "en", "ko")
-    elif source_lang == "th":
-        th_text = clean
-        en_text = translate_sync(clean, "th", "en")
-        ko_text = translate_sync(en_text, "en", "ko")
-    else:
-        ko_text = clean
-        en_text = translate_sync(clean, "ko", "en")
-        th_text = translate_sync(en_text, "en", "th")
+    log.info("Translating message | source=%s | chars=%d", source_lang, len(clean))
 
-    return {"source": source_lang, "en": en_text, "th": th_text, "ko": ko_text}
+    if source_lang == "en":
+        targets = {
+            "th": translate_sync(clean, "en", "th"),
+            "ko": translate_sync(clean, "en", "ko"),
+        }
+    elif source_lang == "th":
+        targets = {
+            "en": translate_sync(clean, "th", "en"),
+            "ko": translate_sync(clean, "en", "ko"),
+        }
+    else:
+        targets = {
+            "en": translate_sync(clean, "ko", "en"),
+            "th": translate_sync(clean, "en", "th"),
+        }
+
+    return {"source": source_lang, **targets}
 
 
 def build_response(result: dict[str, str]) -> str:
-    return (
-        f"[EN] {result['en']}\n"
-        f"[TH] {result['th']}\n"
-        f"[KO] {result['ko']}"
-    )
+    source = result["source"]
+    if source == "th":
+        return f"[EN] {result['en']}\n[KO] {result['ko']}"
+    if source == "en":
+        return f"[TH] {result['th']}\n[KO] {result['ko']}"
+    return f"[EN] {result['en']}\n[TH] {result['th']}"
 
 
 async def index(request: web.Request) -> web.Response:
@@ -273,6 +301,8 @@ async def health(request: web.Request) -> web.Response:
             "version": JAVIS_VERSION,
             "engine": "Argos Translate + CTranslate2",
             "compute_type": os.getenv("ARGOS_COMPUTE_TYPE", "auto"),
+            "chunk_type": os.getenv("ARGOS_CHUNK_TYPE", "DEFAULT"),
+            "cached_translation_pairs": [f"{src}->{dst}" for src, dst in sorted(TRANSLATOR_CACHE)],
             "discord_token_configured": token_configured,
             "discord_ready": bot.is_ready(),
         },
@@ -315,6 +345,7 @@ async def status_command(ctx: commands.Context):
         f"Version: v{JAVIS_VERSION}\n"
         f"Engine: Argos Translate + CTranslate2\n"
         f"Quantization: {os.getenv('ARGOS_COMPUTE_TYPE', 'auto')}\n"
+        f"Chunking: {os.getenv('ARGOS_CHUNK_TYPE', 'DEFAULT')}\n"
         f"Languages: TH ↔ EN ↔ KO",
         mention_author=False,
         allowed_mentions=ALLOWED_MENTIONS,
@@ -379,6 +410,7 @@ async def on_message(message: discord.Message):
         async with TRANSLATION_LOCK:
             result = await asyncio.to_thread(translate_all_sync, content)
         response = build_response(result)
+        log.info("Translation completed | source=%s | response_chars=%d", result["source"], len(response))
 
         # Keep comfortably below Discord's 2000-character message limit.
         if len(response) <= 1900:
@@ -417,7 +449,13 @@ async def main():
             "(or DISCORD_BOT_TOKEN as the compatibility name); never put the token in source code."
         )
 
-    log.info("Starting JAVIS v%s | Engine=Argos Translate + CTranslate2 | Compute=%s | Port=%s", JAVIS_VERSION, os.getenv("ARGOS_COMPUTE_TYPE", "auto"), PORT)
+    log.info(
+        "Starting JAVIS v%s | Engine=Argos Translate + CTranslate2 | Compute=%s | Chunk=%s | Port=%s",
+        JAVIS_VERSION,
+        os.getenv("ARGOS_COMPUTE_TYPE", "auto"),
+        os.getenv("ARGOS_CHUNK_TYPE", "DEFAULT"),
+        PORT,
+    )
     runner = await start_http_server()
     try:
         await bot.start(discord_token)
