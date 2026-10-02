@@ -12,26 +12,58 @@
     h1 { margin: 0 0 8px; font-size: 30px; }
     p { color: #b8c0cc; line-height: 1.6; }
     .ok { display: inline-flex; padding: 6px 10px; border-radius: 999px; background: #12351f; color: #7ee2a8; font-size: 14px; }
-    code { background: #0c0e12; padding: 2px 6px; border-radius: 6px; }
+    .warn { background: #3a2b0b; color: #ffd98a; }
     .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-top: 20px; }
     .item { padding: 14px; background: #11141a; border: 1px solid #252b35; border-radius: 12px; }
     .label { color: #8f98a8; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
     .value { margin-top: 5px; font-weight: 600; }
+    code { background: #0c0e12; padding: 2px 6px; border-radius: 6px; }
   </style>
 </head>
 <body>
   <main>
     <section class="card">
-      <span class="ok">● JAVIS ONLINE</span>
+      <span id="badge" class="ok">● CHECKING STATUS</span>
       <h1>JAVIS — TWOM Auto Translator</h1>
-      <p>Discord translation service is running. This page is only a status page; Discord bot behavior remains unchanged.</p>
+      <p id="message">กำลังตรวจสอบสถานะบริการ...</p>
       <div class="grid">
         <div class="item"><div class="label">Languages</div><div class="value">TH ↔ EN ↔ KO</div></div>
         <div class="item"><div class="label">Engine</div><div class="value">Argos + CTranslate2</div></div>
         <div class="item"><div class="label">Compute</div><div class="value">CPU / INT8</div></div>
+        <div class="item"><div class="label">Discord Token</div><div id="token" class="value">Checking...</div></div>
+        <div class="item"><div class="label">Discord Bot</div><div id="discord" class="value">Checking...</div></div>
         <div class="item"><div class="label">Health</div><div class="value"><a href="/health" style="color:inherit">/health</a></div></div>
       </div>
     </section>
   </main>
+<script>
+async function refreshStatus() {
+  const badge = document.getElementById('badge');
+  const message = document.getElementById('message');
+  const token = document.getElementById('token');
+  const discord = document.getElementById('discord');
+  try {
+    const res = await fetch('/health', { cache: 'no-store' });
+    const data = await res.json();
+    token.textContent = data.discord_token_configured ? 'Configured ✅' : 'Missing ❌';
+    discord.textContent = data.discord_ready ? 'Connected ✅' : 'Not connected ❌';
+    if (data.discord_token_configured && data.discord_ready) {
+      badge.textContent = '● JAVIS ONLINE';
+      badge.className = 'ok';
+      message.textContent = 'Discord bot is connected and the HTTP health service is running.';
+    } else {
+      badge.textContent = '● CONFIGURATION REQUIRED';
+      badge.className = 'ok warn';
+      message.innerHTML = 'Set <code>DISCORD_TOKEN</code> in Render → Environment, then redeploy/restart the service.';
+    }
+  } catch (err) {
+    badge.textContent = '● HEALTH CHECK FAILED';
+    badge.className = 'ok warn';
+    message.textContent = 'ไม่สามารถอ่านสถานะ /health ได้';
+  }
+}
+refreshStatus();
+setInterval(refreshStatus, 30000);
+</script>
 </body>
 </html>

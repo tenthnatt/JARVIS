@@ -13,7 +13,17 @@ BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+def get_discord_token() -> str:
+    """Read the Discord bot token only from environment variables.
+
+    Primary name is DISCORD_TOKEN. DISCORD_BOT_TOKEN is accepted as a
+    compatibility alias so the secret never needs to be placed in source.
+    """
+    return (
+        os.getenv("DISCORD_TOKEN", "").strip()
+        or os.getenv("DISCORD_BOT_TOKEN", "").strip()
+    )
+
 PORT = int(os.getenv("PORT", "10000"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "1200"))
 TRANSLATION_LOCK = asyncio.Lock()
@@ -230,13 +240,17 @@ async def index(request: web.Request) -> web.Response:
 
 
 async def health(request: web.Request) -> web.Response:
+    token_configured = bool(get_discord_token())
     return web.json_response(
         {
-            "ok": True,
+            "ok": token_configured,
             "bot": "JAVIS",
             "engine": "Argos Translate + CTranslate2",
             "compute_type": os.getenv("ARGOS_COMPUTE_TYPE", "auto"),
-        }
+            "discord_token_configured": token_configured,
+            "discord_ready": bot.is_ready(),
+        },
+        status=200 if token_configured else 503,
     )
 
 
@@ -356,12 +370,16 @@ async def on_message(message: discord.Message):
 
 
 async def main():
-    if not DISCORD_TOKEN:
-        raise RuntimeError("DISCORD_TOKEN is not set")
+    discord_token = get_discord_token()
+    if not discord_token:
+        raise RuntimeError(
+            "Discord bot token is missing. Set DISCORD_TOKEN in Render Environment "
+            "(or DISCORD_BOT_TOKEN as the compatibility name); never put the token in source code."
+        )
 
     runner = await start_http_server()
     try:
-        await bot.start(DISCORD_TOKEN)
+        await bot.start(discord_token)
     finally:
         await runner.cleanup()
         await bot.close()

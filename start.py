@@ -15,6 +15,11 @@ os.environ.setdefault("ARGOS_INTRA_THREADS", "1")
 os.environ.setdefault("ARGOS_BATCH_SIZE", "8")
 os.environ.setdefault("ARGOS_BEAM_SIZE", "2")
 
+# Discord token must remain a Render Environment Secret.
+# Accept DISCORD_BOT_TOKEN as a compatibility alias without exposing the token in code.
+if not os.getenv("DISCORD_TOKEN", "").strip() and os.getenv("DISCORD_BOT_TOKEN", "").strip():
+    os.environ["DISCORD_TOKEN"] = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+
 from bot import main  # noqa: E402  (must load after environment defaults above)
 
 
