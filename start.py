@@ -1,4 +1,4 @@
-"""JAVIS Render/Docker entrypoint v1.0.7.
+"""JAVIS Render/Docker entrypoint v1.0.8.
 
 Sets all Argos/CTranslate2 runtime settings BEFORE bot.py imports anything that
 needs those settings. The Discord bot itself remains in bot.py.
@@ -7,17 +7,23 @@ needs those settings. The Discord bot itself remains in bot.py.
 import asyncio
 import os
 
-JAVIS_VERSION = "1.0.7"
+JAVIS_VERSION = "1.0.8"
 os.environ["JAVIS_VERSION"] = JAVIS_VERSION
 
 # Runtime quantization: CTranslate2 models are loaded as INT8 in RAM.
 # Render Environment Variables may override these values, but these defaults
-# ensure a correct configuration even when they are not manually added.
+# ensure a correct configuration even when they are not manually added. Batch size is clamped to 1 on the Free/512 MB profile.
 os.environ.setdefault("ARGOS_COMPUTE_TYPE", "int8")
 os.environ.setdefault("ARGOS_DEVICE_TYPE", "cpu")
 os.environ.setdefault("ARGOS_INTER_THREADS", "1")
 os.environ.setdefault("ARGOS_INTRA_THREADS", "1")
-os.environ.setdefault("ARGOS_BATCH_SIZE", "1")
+# Render Environment Variables can override setdefault(). For the 512 MB
+# Free plan, force batch size back to 1 when a larger value is configured.
+try:
+    _configured_batch = int(os.getenv("ARGOS_BATCH_SIZE", "1"))
+except ValueError:
+    _configured_batch = 1
+os.environ["ARGOS_BATCH_SIZE"] = "1" if _configured_batch > 1 else str(max(1, _configured_batch))
 os.environ.setdefault("ARGOS_BEAM_SIZE", "2")
 os.environ.setdefault("ARGOS_CHUNK_TYPE", "MINISBD")
 os.environ.setdefault(

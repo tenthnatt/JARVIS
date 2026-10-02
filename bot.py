@@ -2,11 +2,11 @@ import asyncio
 import gc
 import json
 import logging
-import multiprocessing as mp
 import os
-import queue
 import re
 import time
+import subprocess
+import sys
 from pathlib import Path
 
 from aiohttp import web
@@ -16,7 +16,7 @@ from discord.ext import commands
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.7")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.8")
 
 PORT = int(os.getenv("PORT", "10000"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "1200"))
@@ -31,6 +31,16 @@ os.environ.setdefault("ARGOS_INTER_THREADS", "1")
 os.environ.setdefault("ARGOS_INTRA_THREADS", "1")
 os.environ.setdefault("ARGOS_BATCH_SIZE", "1")
 os.environ.setdefault("ARGOS_BEAM_SIZE", "2")
+
+# Render Free is a 512 MB RAM plan. If a Render Environment Variable
+# overrides batch size above 1, clamp it back to 1 to reduce peak RAM.
+try:
+    _runtime_batch = int(os.getenv("ARGOS_BATCH_SIZE", "1"))
+except ValueError:
+    _runtime_batch = 1
+if _runtime_batch > 1:
+    os.environ["ARGOS_BATCH_SIZE"] = "1"
+
 os.environ.setdefault("ARGOS_CHUNK_TYPE", "MINISBD")
 os.environ.setdefault(
     "ARGOS_PACKAGE_INDEX",
@@ -179,186 +189,191 @@ def prepare_for_translation(text: str, source_lang: str) -> tuple[str, Protector
 
 
 # ---------------------------------------------------------------------------
-# Dedicated Argos worker process
+# Dedicated Argos translation subprocess
 # ---------------------------------------------------------------------------
 
+# The subprocess is intentionally tiny: it imports Argos only for one target
+# translation, returns the result, then exits. This avoids keeping CTranslate2
+# allocations alive between TH->EN / EN->KO (or the reverse pivot route).
+ARGOS_SUBPROCESS_SCRIPT = r"""
+import json
+import os
+import sys
+import traceback
 
-def _release_worker_translation(translation: object) -> None:
-    """Drop the heavy CTranslate2/SBD objects before the next target loads."""
+def main():
+    payload = json.loads(sys.stdin.read())
+    source_lang = payload["source"]
+    target_lang = payload["target"]
+    text = payload["text"]
+
     try:
-        if hasattr(translation, "translator"):
-            translation.translator = None
-    except Exception:
-        pass
-    try:
-        sentencizer = getattr(translation, "sentencizer", None)
-        if sentencizer is not None and hasattr(sentencizer, "detector"):
-            sentencizer.detector = None
-    except Exception:
-        pass
-    gc.collect()
+        import argostranslate.translate as argos_translate
 
+        installed = argos_translate.get_installed_languages()
+        from_lang = next((lang for lang in installed if lang.code == source_lang), None)
+        to_lang = next((lang for lang in installed if lang.code == target_lang), None)
 
-def translation_worker_main(request_q, response_q) -> None:
-    """Run Argos/CTranslate2 outside the Discord process.
-
-    This is the RAM-critical change in v1.0.7. Only this child process imports
-    Argos. It handles one target at a time and releases the CTranslate2 model
-    before accepting the next target, while the parent keeps Discord/HTTP alive.
-    """
-    import argostranslate.translate as argos_translate
-
-    log_worker = logging.getLogger("JAVIS.argos-worker")
-    route_cache: dict[tuple[str, str], object] = {}
-    installed = None
-
-    # Verify that the requested runtime compression settings reached the worker.
-    try:
-        from argostranslate import settings as argos_settings
-        log_worker.info(
-            "Argos worker ready | device=%s | compute_type=%s | batch=%s | beam=%s | chunk=%s",
-            getattr(argos_settings, "device", os.getenv("ARGOS_DEVICE_TYPE")),
-            getattr(argos_settings, "compute_type", os.getenv("ARGOS_COMPUTE_TYPE")),
-            getattr(argos_settings, "batch_size", os.getenv("ARGOS_BATCH_SIZE")),
-            getattr(argos_settings, "beam_size", os.getenv("ARGOS_BEAM_SIZE")),
-            os.getenv("ARGOS_CHUNK_TYPE", "MINISBD"),
-        )
-    except Exception:
-        log_worker.exception("Could not read Argos runtime settings")
-
-    while True:
-        job = request_q.get()
-        if job is None:
-            break
-
-        request_id, text, source_lang, target_lang = job
-        translation = None
-        try:
-            if installed is None:
-                installed = argos_translate.get_installed_languages()
-
-            cache_key = (source_lang, target_lang)
-            translation = route_cache.get(cache_key)
-            if translation is None:
-                from_lang = next((lang for lang in installed if lang.code == source_lang), None)
-                to_lang = next((lang for lang in installed if lang.code == target_lang), None)
-                translation = from_lang.get_translation(to_lang) if from_lang and to_lang else None
-
-                if translation is None:
-                    # One refresh attempt handles stale Argos package/language state.
-                    try:
-                        argos_translate.get_installed_languages.cache_clear()
-                    except Exception:
-                        pass
-                    installed = argos_translate.get_installed_languages()
-                    from_lang = next((lang for lang in installed if lang.code == source_lang), None)
-                    to_lang = next((lang for lang in installed if lang.code == target_lang), None)
-                    translation = from_lang.get_translation(to_lang) if from_lang and to_lang else None
-
-                if translation is None:
-                    pairs = []
-                    for lang in installed:
-                        for candidate in getattr(lang, "translations_from", []):
-                            pairs.append(f"{candidate.from_lang.code}->{candidate.to_lang.code}")
-                    raise RuntimeError(
-                        f"Argos translation route unavailable: {source_lang}->{target_lang}; "
-                        f"installed routes: {', '.join(sorted(set(pairs))) or 'none'}"
-                    )
-                route_cache[cache_key] = translation
-
-            result = translation.translate(text)
-            response_q.put((request_id, True, result, ""))
-        except Exception as exc:
-            log_worker.exception(
-                "Argos worker translation failed | %s->%s",
-                source_lang,
-                target_lang,
+        if from_lang is None or to_lang is None:
+            raise RuntimeError(
+                f"Argos language unavailable: {source_lang}->{target_lang}"
             )
-            response_q.put((request_id, False, "", repr(exc)))
-        finally:
-            if translation is not None:
-                _release_worker_translation(translation)
-            # Keep route metadata but never a loaded CTranslate2 model resident.
-            translation = None
-            gc.collect()
 
-    # Drop route objects on worker shutdown.
-    route_cache.clear()
-    gc.collect()
+        translation = from_lang.get_translation(to_lang)
+        if translation is None:
+            routes = []
+            for lang in installed:
+                for candidate in getattr(lang, "translations_from", []):
+                    routes.append(
+                        f"{candidate.from_lang.code}->{candidate.to_lang.code}"
+                    )
+            raise RuntimeError(
+                f"Argos translation route unavailable: "
+                f"{source_lang}->{target_lang}; "
+                f"installed routes: {', '.join(sorted(set(routes))) or 'none'}"
+            )
 
+        result = translation.translate(text)
+        print(
+            json.dumps(
+                {"ok": True, "result": str(result)},
+                ensure_ascii=False,
+            )
+        )
+    except Exception as exc:
+        traceback.print_exc(file=sys.stderr)
+        print(
+            json.dumps(
+                {"ok": False, "error": repr(exc)},
+                ensure_ascii=False,
+            )
+        )
+        raise
+
+if __name__ == "__main__":
+    main()
+"""
 
 class ArgosWorkerClient:
+    """Compatibility wrapper around an isolated one-shot Argos subprocess.
+
+    The previous v1.0.7 long-lived worker kept the Python/Argos runtime resident
+    under the same Render cgroup. v1.0.8 exits the subprocess after every target,
+    so its CTranslate2 memory is returned to the OS before the next target.
+    """
+
     def __init__(self) -> None:
-        ctx = mp.get_context("spawn")
-        self.request_q = ctx.Queue(maxsize=2)
-        self.response_q = ctx.Queue(maxsize=2)
-        self.process = ctx.Process(
-            target=translation_worker_main,
-            args=(self.request_q, self.response_q),
-            name="javis-argos-worker",
-            daemon=True,
-        )
-        self.next_request_id = 0
+        self.started = False
 
     def start(self) -> None:
-        self.process.start()
+        self.started = True
         log.info(
-            "Argos worker process started | pid=%s | compute=%s | device=%s | batch=%s | beam=%s",
-            self.process.pid,
-            os.getenv("ARGOS_COMPUTE_TYPE", "auto"),
+            "Argos isolated runner ready | mode=subprocess-per-target | "
+            "compute=%s | device=%s | batch=%s | beam=%s",
+            os.getenv("ARGOS_COMPUTE_TYPE", "int8"),
             os.getenv("ARGOS_DEVICE_TYPE", "cpu"),
             os.getenv("ARGOS_BATCH_SIZE", "1"),
             os.getenv("ARGOS_BEAM_SIZE", "2"),
         )
 
     def ensure_alive(self) -> None:
-        if not self.process.is_alive():
-            exitcode = self.process.exitcode
-            raise RuntimeError(f"Argos worker is not running (exitcode={exitcode})")
+        if not self.started:
+            raise RuntimeError("Argos isolated runner is not started")
 
     def translate(self, text: str, source_lang: str, target_lang: str) -> str:
         self.ensure_alive()
-        request_id = self.next_request_id
-        self.next_request_id += 1
-        self.request_q.put((request_id, text, source_lang, target_lang), timeout=5)
-        deadline = time.monotonic() + TRANSLATION_TIMEOUT_SECONDS
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"Argos worker timed out after {TRANSLATION_TIMEOUT_SECONDS}s "
-                    f"({source_lang}->{target_lang})"
-                )
-            try:
-                response_id, ok, result, error = self.response_q.get(timeout=min(2, remaining))
-            except queue.Empty:
-                self.ensure_alive()
+
+        payload = json.dumps(
+            {
+                "text": text,
+                "source": source_lang,
+                "target": target_lang,
+            },
+            ensure_ascii=False,
+        )
+
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+
+        log.info(
+            "Argos target start | %s->%s | chars=%d | batch=%s | compute=%s",
+            source_lang,
+            target_lang,
+            len(text),
+            env.get("ARGOS_BATCH_SIZE", "1"),
+            env.get("ARGOS_COMPUTE_TYPE", "int8"),
+        )
+
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-c", ARGOS_SUBPROCESS_SCRIPT],
+                input=payload,
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=TRANSLATION_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(
+                f"Argos target timed out after "
+                f"{TRANSLATION_TIMEOUT_SECONDS}s ({source_lang}->{target_lang})"
+            ) from exc
+
+        stderr = (completed.stderr or "").strip()
+        stdout = (completed.stdout or "").strip()
+
+        if stderr:
+            # Keep the useful Argos log context without allowing an enormous
+            # stderr buffer to flood the Render log.
+            for line in stderr.splitlines()[-40:]:
+                logging.getLogger("JAVIS.argos-worker").info(line)
+
+        # The worker emits exactly one JSON result line on stdout.
+        response = None
+        for line in reversed(stdout.splitlines()):
+            line = line.strip()
+            if not line:
                 continue
-            if response_id != request_id:
-                # Only one Discord translation job is allowed at a time by
-                # TRANSLATION_LOCK, so an unexpected ID indicates a worker-state bug.
-                raise RuntimeError(
-                    f"Argos worker response mismatch: expected={request_id}, got={response_id}"
-                )
-            if not ok:
-                raise RuntimeError(error)
-            return str(result)
+            try:
+                candidate = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict) and "ok" in candidate:
+                response = candidate
+                break
+
+        if completed.returncode != 0:
+            error_detail = (
+                response.get("error")
+                if isinstance(response, dict)
+                else None
+            )
+            if not error_detail:
+                error_detail = stderr[-4000:] or "unknown Argos subprocess error"
+            raise RuntimeError(
+                f"Argos subprocess failed ({source_lang}->{target_lang}): "
+                f"{error_detail}"
+            )
+
+        if not isinstance(response, dict) or not response.get("ok"):
+            raise RuntimeError(
+                f"Argos subprocess returned no successful result "
+                f"({source_lang}->{target_lang})"
+            )
+
+        result = str(response.get("result", ""))
+        log.info(
+            "Argos target complete | %s->%s | result_chars=%d | subprocess_exit=%s",
+            source_lang,
+            target_lang,
+            len(result),
+            completed.returncode,
+        )
+        return result
 
     def shutdown(self) -> None:
-        if self.process.is_alive():
-            try:
-                self.request_q.put(None, timeout=2)
-            except Exception:
-                pass
-            self.process.join(timeout=5)
-        if self.process.is_alive():
-            self.process.terminate()
-            self.process.join(timeout=2)
-        try:
-            self.request_q.close()
-            self.response_q.close()
-        except Exception:
-            pass
+        self.started = False
 
 
 ARGOS_WORKER: ArgosWorkerClient | None = None
@@ -366,7 +381,7 @@ ARGOS_WORKER: ArgosWorkerClient | None = None
 
 def translate_sync(text: str, source_lang: str, target_lang: str) -> str:
     if ARGOS_WORKER is None:
-        raise RuntimeError("Argos worker is not started")
+        raise RuntimeError("Argos isolated runner is not started")
     prepared, protector = prepare_for_translation(text, source_lang)
     result = ARGOS_WORKER.translate(prepared, source_lang, target_lang)
     return restore_twom_terms(result, protector, target_lang)
@@ -415,7 +430,7 @@ async def index(request: web.Request) -> web.Response:
 
 async def health(request: web.Request) -> web.Response:
     token_configured = bool(get_discord_token())
-    worker_alive = ARGOS_WORKER is not None and ARGOS_WORKER.process.is_alive()
+    worker_alive = ARGOS_WORKER is not None and ARGOS_WORKER.started
     return web.json_response(
         {
             "ok": token_configured and worker_alive,
@@ -428,6 +443,7 @@ async def health(request: web.Request) -> web.Response:
             "batch_size": int(os.getenv("ARGOS_BATCH_SIZE", "1")),
             "beam_size": int(os.getenv("ARGOS_BEAM_SIZE", "2")),
             "translation_worker_alive": worker_alive,
+            "translation_runner_mode": "subprocess-per-target",
             "discord_token_configured": token_configured,
             "discord_ready": bot.is_ready(),
         },
@@ -477,7 +493,7 @@ async def on_ready():
 
 @bot.command(name="status")
 async def status_command(ctx: commands.Context):
-    worker_alive = ARGOS_WORKER is not None and ARGOS_WORKER.process.is_alive()
+    worker_alive = ARGOS_WORKER is not None and ARGOS_WORKER.started
     await ctx.reply(
         "JAVIS พร้อมใช้งาน ✅\n"
         f"Version: v{JAVIS_VERSION}\n"
@@ -541,6 +557,25 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     log.exception("Discord command error", exc_info=error)
 
 
+async def send_safe_translation(
+    message: discord.Message,
+    content: str,
+) -> None:
+    try:
+        await message.reply(
+            content,
+            mention_author=False,
+            allowed_mentions=ALLOWED_MENTIONS,
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        # Fallback for channels where reply-to-message is unavailable.
+        log.exception("Discord reply failed; falling back to channel.send")
+        await message.channel.send(
+            content,
+            allowed_mentions=ALLOWED_MENTIONS,
+        )
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -570,11 +605,7 @@ async def on_message(message: discord.Message):
         )
 
         if len(response) <= 1900:
-            await message.reply(
-                response,
-                mention_author=False,
-                allowed_mentions=ALLOWED_MENTIONS,
-            )
+            await send_safe_translation(message, response)
         else:
             chunks = []
             current = ""
@@ -588,24 +619,20 @@ async def on_message(message: discord.Message):
                     current = candidate
             if current:
                 chunks.append(current)
-            for index, chunk in enumerate(chunks):
-                if index == 0:
-                    await message.reply(
-                        chunk,
-                        mention_author=False,
-                        allowed_mentions=ALLOWED_MENTIONS,
-                    )
-                else:
-                    await message.channel.send(
-                        chunk,
-                        allowed_mentions=ALLOWED_MENTIONS,
-                    )
+
+            # First chunk uses reply for the normal UX; fallback to channel.send
+            # is handled inside send_safe_translation.
+            await send_safe_translation(message, chunks[0])
+            for chunk in chunks[1:]:
+                await message.channel.send(
+                    chunk,
+                    allowed_mentions=ALLOWED_MENTIONS,
+                )
     except Exception as exc:
         log.exception("Translation failed")
-        await message.reply(
+        await send_safe_translation(
+            message,
             "JAVIS แปลข้อความนี้ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง",
-            mention_author=False,
-            allowed_mentions=ALLOWED_MENTIONS,
         )
 
 
