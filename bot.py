@@ -14,7 +14,7 @@ DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
 
 # Release version for this deploy. Keep this value in sync with the copy-ready filenames.
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.2")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.3")
 
 def get_discord_token() -> str:
     """Read the Discord bot token only from environment variables.
@@ -50,6 +50,28 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+
+class SuppressUnusedVoiceDependencyWarning(logging.Filter):
+    """Hide only optional voice-dependency warnings that are irrelevant to JAVIS.
+
+    JAVIS is intentionally a text-only translation bot. PyNaCl and davey are
+    optional Discord voice dependencies; installing them would add packages
+    that the application never uses. All other discord.client log messages
+    remain unchanged.
+    """
+
+    _IGNORED = {
+        "PyNaCl is not installed, voice will NOT be supported",
+        "davey is not installed, voice will NOT be supported",
+    }
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.getMessage() not in self._IGNORED
+
+
+discord_client_logger = logging.getLogger("discord.client")
+discord_client_logger.addFilter(SuppressUnusedVoiceDependencyWarning())
+
 log = logging.getLogger("JAVIS")
 
 SUPPORTED = {"en", "th", "ko"}
@@ -294,6 +316,19 @@ async def status_command(ctx: commands.Context):
         f"Engine: Argos Translate + CTranslate2\n"
         f"Quantization: {os.getenv('ARGOS_COMPUTE_TYPE', 'auto')}\n"
         f"Languages: TH ↔ EN ↔ KO",
+        mention_author=False,
+        allowed_mentions=ALLOWED_MENTIONS,
+    )
+
+
+@bot.command(name="help")
+async def help_command(ctx: commands.Context):
+    await ctx.reply(
+        "JAVIS Help 📘\n"
+        "• ส่งข้อความปกติ: บอทตอบ [EN] [TH] [KO] ในข้อความเดียว\n"
+        "• !javis status: ดูสถานะและ Version ของบอท\n"
+        "• !javis reload: โหลด TWOM Dictionary ใหม่ (ต้องมี Manage Server)\n"
+        "• !javis help: แสดงคำสั่งนี้",
         mention_author=False,
         allowed_mentions=ALLOWED_MENTIONS,
     )
