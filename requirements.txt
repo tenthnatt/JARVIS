@@ -1,0 +1,4 @@
+discord.py>=2.5,<3
+aiohttp>=3.14,<4
+argostranslate==1.11.1
+ctranslate2==4.8.2

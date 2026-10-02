@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: javis-twom-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: ARGOS_COMPUTE_TYPE
+        value: int8
+      - key: ARGOS_DEVICE_TYPE
+        value: cpu
+      - key: ARGOS_INTER_THREADS
+        value: "1"
+      - key: ARGOS_INTRA_THREADS
+        value: "1"
+      - key: ARGOS_BATCH_SIZE
+        value: "8"
+      - key: ARGOS_BEAM_SIZE
+        value: "2"
+      - key: MAX_INPUT_CHARS
+        value: "1200"
