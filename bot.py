@@ -16,7 +16,7 @@ from discord.ext import commands
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.13")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.14")
 
 PORT = int(os.getenv("PORT", "10000"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "1200"))
@@ -237,6 +237,21 @@ def restore_twom_terms(text: str, protector: Protector, target_lang: str) -> str
                     target = value
                 break
         text = text.replace(token, target if target is not None else original)
+    return text
+
+
+def protect_common_content(text: str, protector: Protector) -> str:
+    """Defensively protect common Discord/non-translatable content.
+
+    The message is normally split by split_non_translatable_spans() before
+    this function runs, so URL/emoji-only spans never reach the translator.
+    This function is kept as a defensive second layer for any content that
+    remains inside a translatable fragment.
+    """
+    text = protector.protect_regex(text, URL_PATTERN, re.IGNORECASE)
+    text = protector.protect_regex(text, MENTION_PATTERN)
+    text = protector.protect_regex(text, CUSTOM_DISCORD_EMOJI_PATTERN)
+    text = protector.protect_regex(text, UNICODE_EMOJI_PATTERN)
     return text
 
 
