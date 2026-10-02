@@ -13,6 +13,9 @@ BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
 
+# Release version for this deploy. Keep this value in sync with the copy-ready filenames.
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.2")
+
 def get_discord_token() -> str:
     """Read the Discord bot token only from environment variables.
 
@@ -245,6 +248,7 @@ async def health(request: web.Request) -> web.Response:
         {
             "ok": token_configured,
             "bot": "JAVIS",
+            "version": JAVIS_VERSION,
             "engine": "Argos Translate + CTranslate2",
             "compute_type": os.getenv("ARGOS_COMPUTE_TYPE", "auto"),
             "discord_token_configured": token_configured,
@@ -278,7 +282,7 @@ ALLOWED_MENTIONS = discord.AllowedMentions.none()
 
 @bot.event
 async def on_ready():
-    log.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "?")
+    log.info("Logged in as %s (%s) | JAVIS v%s", bot.user, bot.user.id if bot.user else "?", JAVIS_VERSION)
     await bot.change_presence(activity=discord.Game(name="TH ↔ EN ↔ KO | TWOM"))
 
 
@@ -286,6 +290,7 @@ async def on_ready():
 async def status_command(ctx: commands.Context):
     await ctx.reply(
         "JAVIS พร้อมใช้งาน ✅\n"
+        f"Version: v{JAVIS_VERSION}\n"
         f"Engine: Argos Translate + CTranslate2\n"
         f"Quantization: {os.getenv('ARGOS_COMPUTE_TYPE', 'auto')}\n"
         f"Languages: TH ↔ EN ↔ KO",
@@ -377,6 +382,7 @@ async def main():
             "(or DISCORD_BOT_TOKEN as the compatibility name); never put the token in source code."
         )
 
+    log.info("Starting JAVIS v%s | Engine=Argos Translate + CTranslate2 | Compute=%s | Port=%s", JAVIS_VERSION, os.getenv("ARGOS_COMPUTE_TYPE", "auto"), PORT)
     runner = await start_http_server()
     try:
         await bot.start(discord_token)
