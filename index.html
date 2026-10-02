@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>JAVIS — TWOM Translator v1.0.9</title>
+  <title>JAVIS — TWOM Translator v1.0.10</title>
   <style>
     :root { color-scheme: dark; }
     body { margin:0; font-family:system-ui,-apple-system,Segoe UI,sans-serif; background:#0f1115; color:#f3f4f6; }
@@ -28,12 +28,13 @@
   <h1>JAVIS — TWOM Auto Translator</h1>
   <p id="message">กำลังตรวจสอบสถานะบริการ...</p>
   <div class="grid">
-    <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.9</div></div>
+    <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.10</div></div>
     <div class="item"><div class="label">Languages</div><div class="value">TH → EN + KO<br>EN → TH + KO<br>KO → EN + TH</div></div>
     <div class="item"><div class="label">Engine</div><div class="value">Argos + CTranslate2</div></div>
     <div class="item"><div class="label">Runtime Quantization</div><div id="compute" class="value">Checking...</div></div>
     <div class="item"><div class="label">Device</div><div id="device" class="value">Checking...</div></div>
     <div class="item"><div class="label">Batch / Beam</div><div id="batch" class="value">Checking...</div></div>
+    <div class="item"><div class="label">Korean Engine</div><div id="koengine" class="value">Checking...</div></div>
     <div class="item"><div class="label">Chunking</div><div id="chunk" class="value">Checking...</div></div>
     <div class="item"><div class="label">Translation Runner</div><div id="worker" class="value">Checking...</div></div>
     <div class="item"><div class="label">Discord Bot</div><div id="discord" class="value">Checking...</div></div>
@@ -60,6 +61,7 @@ async function refreshStatus() {
     document.getElementById('compute').textContent=d.compute_type || 'unknown';
     document.getElementById('device').textContent=d.device_type || 'unknown';
     document.getElementById('batch').textContent=`${d.batch_size ?? '?'} / ${d.beam_size ?? '?'}`;
+    document.getElementById('koengine').textContent=`${d.korean_engine || 'argos-native'} · Beam ${d.korean_beam_size ?? '?'}`;
     document.getElementById('chunk').textContent=d.chunk_type || 'unknown';
     document.getElementById('worker').textContent=d.translation_worker_alive ? `READY ✅ (${d.translation_runner_mode || 'direct'})` : 'OFFLINE ❌';
     document.getElementById('packages').textContent=d.argos_packages_dir || 'default';
@@ -67,7 +69,7 @@ async function refreshStatus() {
     document.getElementById('discord').textContent=d.discord_ready ? 'Connected ✅' : 'Not connected ❌';
     if(d.ok && d.translation_worker_alive && d.discord_ready){
       badge.textContent='● JAVIS ONLINE'; badge.className='ok';
-      message.textContent='Discord + Translation worker are running. Runtime INT8 + direct CTranslate2 runner are active.';
+      message.textContent='Discord + Translation worker are running. Runtime INT8 + Korean native Argos pipeline with CTranslate2 fallback are active.';
     } else {
       badge.textContent='● CONFIGURATION / WORKER CHECK'; badge.className='ok warn';
       message.textContent='ตรวจสอบสถานะ Discord token, Discord Gateway และ Translation worker ที่ /health';

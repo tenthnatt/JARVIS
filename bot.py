@@ -16,7 +16,7 @@ from discord.ext import commands
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.9")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.10")
 
 PORT = int(os.getenv("PORT", "10000"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "1200"))
@@ -31,6 +31,8 @@ os.environ.setdefault("ARGOS_INTER_THREADS", "1")
 os.environ.setdefault("ARGOS_INTRA_THREADS", "1")
 os.environ.setdefault("ARGOS_BATCH_SIZE", "1")
 os.environ.setdefault("ARGOS_BEAM_SIZE", "2")
+os.environ.setdefault("ARGOS_KO_ENGINE", "argos-native")
+os.environ.setdefault("ARGOS_KO_BEAM_SIZE", "4")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -253,6 +255,24 @@ def _find_package(source_code, target_code):
                 return meta_path.parent
     return None
 
+def _translate_korean_native(source_code, target_code, text):
+    # For Korean routes, prefer Argos' packaged translation pipeline. This keeps
+    # the package tokenizer, MiniSBD sentence splitting, target_prefix handling,
+    # replace_unknowns behavior, and Argos decoding configuration together.
+    # The subprocess still exits after one target, so CTranslate2 memory is
+    # returned before the next target.
+    os.environ["ARGOS_BATCH_SIZE"] = "1"
+    os.environ["ARGOS_BEAM_SIZE"] = os.getenv("ARGOS_KO_BEAM_SIZE", "4")
+    os.environ["ARGOS_CHUNK_TYPE"] = os.getenv("ARGOS_CHUNK_TYPE", "MINISBD")
+    import argostranslate.translate as argos_translate
+    translation = argos_translate.get_translation_from_codes(source_code, target_code)
+    if translation is None:
+        raise RuntimeError(f"Argos native translation unavailable: {source_code}->{target_code}")
+    result = translation.translate(text)
+    if not isinstance(result, str) or not result.strip():
+        raise RuntimeError(f"Argos native returned empty translation: {source_code}->{target_code}")
+    return result.strip()
+
 def _translate_direct(package_dir, text):
     # Import only the lightweight runtime pieces needed for one model.
     # Do NOT import argostranslate.translate here: that pulls the full
@@ -313,6 +333,8 @@ def _translate_direct(package_dir, text):
         results = translator.translate_batch(
             [source_tokens],
             beam_size=beam_size,
+            length_penalty=0.2,
+            replace_unknowns=True,
             max_batch_size=1,
             return_scores=False,
         )
@@ -338,13 +360,31 @@ def main():
                 f"{source_lang}->{target_lang}"
             )
 
-        result = _translate_direct(package_dir, text)
+        use_korean_native = (
+            os.getenv("ARGOS_KO_ENGINE", "argos-native").lower() == "argos-native"
+            and (source_lang == "ko" or target_lang == "ko")
+        )
+        runner_name = "ct2-direct-from-argos-model"
+        if use_korean_native:
+            try:
+                result = _translate_korean_native(source_lang, target_lang, text)
+                runner_name = "argos-native-korean"
+            except Exception:
+                # Preserve availability: if native Argos cannot load the
+                # package pipeline, fall back to the existing direct CTranslate2
+                # path without changing the rest of the bot.
+                traceback.print_exc(file=sys.stderr)
+                result = _translate_direct(package_dir, text)
+                runner_name = "ct2-direct-korean-fallback"
+        else:
+            result = _translate_direct(package_dir, text)
+
         print(
             json.dumps(
                 {
                     "ok": True,
                     "result": str(result),
-                    "runner": "ct2-direct-from-argos-model",
+                    "runner": runner_name,
                     "source": source_lang,
                     "target": target_lang,
                 },
@@ -582,6 +622,8 @@ async def health(request: web.Request) -> web.Response:
             "chunk_type": os.getenv("ARGOS_CHUNK_TYPE", "MINISBD"),
             "batch_size": int(os.getenv("ARGOS_BATCH_SIZE", "1")),
             "beam_size": int(os.getenv("ARGOS_BEAM_SIZE", "2")),
+            "korean_engine": os.getenv("ARGOS_KO_ENGINE", "argos-native"),
+            "korean_beam_size": int(os.getenv("ARGOS_KO_BEAM_SIZE", "4")),
             "translation_worker_alive": worker_alive,
             "translation_runner_mode": "ct2-direct-from-argos-model-per-target",
             "argos_packages_dir": os.getenv("ARGOS_PACKAGES_DIR", ""),
@@ -642,6 +684,7 @@ async def status_command(ctx: commands.Context):
         f"Quantization: {os.getenv('ARGOS_COMPUTE_TYPE', 'auto')}\n"
         f"Device: {os.getenv('ARGOS_DEVICE_TYPE', 'cpu')}\n"
         f"Batch: {os.getenv('ARGOS_BATCH_SIZE', '1')} | Beam: {os.getenv('ARGOS_BEAM_SIZE', '2')}\n"
+        f"Korean engine: {os.getenv('ARGOS_KO_ENGINE', 'argos-native')} | Korean beam: {os.getenv('ARGOS_KO_BEAM_SIZE', '4')}\n"
         f"Chunking: {os.getenv('ARGOS_CHUNK_TYPE', 'MINISBD')}\n"
         f"Argos Worker: {'ONLINE ✅' if worker_alive else 'OFFLINE ❌'}\n"
         "Languages: TH ↔ EN ↔ KO",
@@ -787,12 +830,14 @@ async def main():
         )
 
     log.info(
-        "Starting JAVIS v%s | Engine=Argos Translate + CTranslate2 | Compute=%s | Device=%s | Batch=%s | Beam=%s | Chunk=%s | Port=%s",
+        "Starting JAVIS v%s | Engine=Argos Translate + CTranslate2 | Compute=%s | Device=%s | Batch=%s | Beam=%s | KO_Engine=%s | KO_Beam=%s | Chunk=%s | Port=%s",
         JAVIS_VERSION,
         os.getenv("ARGOS_COMPUTE_TYPE", "auto"),
         os.getenv("ARGOS_DEVICE_TYPE", "cpu"),
         os.getenv("ARGOS_BATCH_SIZE", "1"),
         os.getenv("ARGOS_BEAM_SIZE", "2"),
+        os.getenv("ARGOS_KO_ENGINE", "argos-native"),
+        os.getenv("ARGOS_KO_BEAM_SIZE", "4"),
         os.getenv("ARGOS_CHUNK_TYPE", "MINISBD"),
         PORT,
     )
