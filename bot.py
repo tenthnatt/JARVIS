@@ -16,7 +16,7 @@ from discord.ext import commands
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.12")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.13")
 
 PORT = int(os.getenv("PORT", "10000"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "1200"))
@@ -139,10 +139,14 @@ def strip_language_prefix(text: str) -> str:
     return re.sub(r"^\s*\[(EN|TH|KO)\]\s*", "", text, count=1, flags=re.IGNORECASE)
 
 
-# URLs and emoji are non-translatable content. URLs/custom Discord emoji are
-# protected as tokens when they appear next to normal language text.
+# URLs and emoji are non-translatable content.  Do NOT replace these
+# fragments with placeholder tokens before translation: some SentencePiece /
+# CTranslate2 tokenizers can alter placeholder text (e.g. JAVISX1QZ). Instead,
+# v1.0.13 splits the message into translatable and non-translatable spans,
+# translates only the language spans, and rejoins the untouched URLs/emoji.
 URL_PATTERN = r"(?:https?://|www\.)[^\s<>]+"
 CUSTOM_DISCORD_EMOJI_PATTERN = r"<a?:[A-Za-z0-9_]+:\d+>"
+MENTION_PATTERN = r"<@!?\d+>"
 # Common Unicode emoji blocks plus variation selectors / ZWJ / skin tones.
 UNICODE_EMOJI_PATTERN = (
     r"(?:[\U0001F1E6-\U0001F1FF]"
@@ -162,25 +166,34 @@ UNICODE_EMOJI_PATTERN = (
     r"(?:[\uFE0E\uFE0F]|[\U0001F3FB-\U0001F3FF])?)*"
     r"(?:[0-9#*]\uFE0F?\u20E3)?"
 )
+NON_TRANSLATABLE_RE = re.compile(
+    rf"(?:{URL_PATTERN}|{MENTION_PATTERN}|{CUSTOM_DISCORD_EMOJI_PATTERN}|{UNICODE_EMOJI_PATTERN})",
+    re.IGNORECASE,
+)
+
+
+def split_non_translatable_spans(text: str) -> list[tuple[bool, str]]:
+    """Split text into (is_protected, fragment) spans without placeholder tokens."""
+    spans: list[tuple[bool, str]] = []
+    last = 0
+    for match in NON_TRANSLATABLE_RE.finditer(text):
+        if match.start() > last:
+            spans.append((False, text[last:match.start()]))
+        spans.append((True, match.group(0)))
+        last = match.end()
+    if last < len(text):
+        spans.append((False, text[last:]))
+    if not spans:
+        spans.append((False, text))
+    return spans
 
 
 def has_translatable_text_after_removing_nontext(text: str) -> bool:
     """Return True when any normal language text remains."""
-    remaining = re.sub(URL_PATTERN, "", text, flags=re.IGNORECASE)
-    remaining = re.sub(r"<@!?\d+>", "", remaining)
-    remaining = re.sub(CUSTOM_DISCORD_EMOJI_PATTERN, "", remaining)
-    remaining = re.sub(UNICODE_EMOJI_PATTERN, "", remaining)
+    remaining = NON_TRANSLATABLE_RE.sub("", text)
     # Remove common zero-width/variation characters left by emoji sequences.
     remaining = remaining.replace("\u200d", "").replace("\ufe0f", "").replace("\ufe0e", "")
     return bool(remaining.strip())
-
-
-def protect_common_content(text: str, protector: Protector) -> str:
-    text = protector.protect_regex(text, URL_PATTERN, re.IGNORECASE)
-    text = protector.protect_regex(text, r"<@!?\d+>")
-    text = protector.protect_regex(text, CUSTOM_DISCORD_EMOJI_PATTERN)
-    text = protector.protect_regex(text, UNICODE_EMOJI_PATTERN)
-    return text
 
 
 def protect_twom_terms(text: str, source_lang: str, protector: Protector) -> str:
@@ -572,9 +585,35 @@ ARGOS_WORKER: ArgosWorkerClient | None = None
 def translate_sync(text: str, source_lang: str, target_lang: str) -> str:
     if ARGOS_WORKER is None:
         raise RuntimeError("Argos isolated runner is not started")
-    prepared, protector = prepare_for_translation(text, source_lang)
-    result = ARGOS_WORKER.translate(prepared, source_lang, target_lang)
-    return restore_twom_terms(result, protector, target_lang)
+
+    # v1.0.13: translate only language spans. URLs, custom Discord emoji,
+    # mentions, and Unicode emoji never enter the translation model. This
+    # prevents placeholder corruption such as "JAVISX1QZ" or "JAV 0 0 0".
+    spans = split_non_translatable_spans(text)
+    output: list[str] = []
+    translated_span_count = 0
+
+    for is_protected, fragment in spans:
+        if is_protected or not fragment:
+            output.append(fragment)
+            continue
+
+        if not fragment.strip():
+            output.append(fragment)
+            continue
+
+        prepared, protector = prepare_for_translation(fragment, source_lang)
+        result = ARGOS_WORKER.translate(prepared, source_lang, target_lang)
+        result = restore_twom_terms(result, protector, target_lang)
+        output.append(result)
+        translated_span_count += 1
+
+    combined = "".join(output)
+    log.info(
+        "Preserved non-translatable spans | source=%s | target=%s | spans=%d",
+        source_lang, target_lang, translated_span_count,
+    )
+    return combined
 
 
 def translate_all_sync(original: str) -> dict[str, str]:
@@ -664,6 +703,7 @@ async def health(request: web.Request) -> web.Response:
             "korean_beam_size": int(os.getenv("ARGOS_KO_BEAM_SIZE", "4")),
             "translation_worker_alive": worker_alive,
             "translation_runner_mode": "ct2-direct-from-argos-model-per-target",
+            "non_translatable_mode": "segment-preserve",
             "argos_packages_dir": os.getenv("ARGOS_PACKAGES_DIR", ""),
             "discord_token_configured": token_configured,
             "discord_ready": bot.is_ready(),
@@ -827,9 +867,9 @@ async def on_message(message: discord.Message):
     if content.startswith(("/", "$", "?")):
         return
 
-    # Do not translate messages that contain only URLs, Discord/custom emoji,
-    # or Unicode emoji. Normal text mixed with a URL/emoji is still translated,
-    # while the non-translatable pieces remain unchanged.
+    # URL/emoji-only messages are ignored. Mixed messages remain translatable;
+    # their URL/emoji/mentions are preserved exactly and never sent through
+    # the translation model.
     if not has_translatable_text_after_removing_nontext(content):
         log.info("Skipping non-translatable message | reason=url-or-emoji-only | chars=%d", len(content))
         return
