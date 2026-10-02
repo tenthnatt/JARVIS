@@ -11,6 +11,7 @@ from discord.ext import commands
 
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
+INDEX_PATH = BASE_DIR / "index.html"
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
@@ -222,6 +223,12 @@ def build_response(result: dict[str, str]) -> str:
     )
 
 
+async def index(request: web.Request) -> web.Response:
+    # Keep the browser landing page separate from the JSON health endpoint
+    # so Render health checks remain machine-readable at /health.
+    return web.FileResponse(INDEX_PATH)
+
+
 async def health(request: web.Request) -> web.Response:
     return web.json_response(
         {
@@ -236,7 +243,7 @@ async def health(request: web.Request) -> web.Response:
 async def start_http_server() -> web.AppRunner:
     app = web.Application()
     app.add_routes([
-        web.get("/", health),
+        web.get("/", index),
         web.get("/health", health),
         web.get("/ping", health),
     ])
@@ -252,6 +259,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!javis ", intents=intents, help_command=None)
+ALLOWED_MENTIONS = discord.AllowedMentions.none()
 
 
 @bot.event
@@ -268,6 +276,7 @@ async def status_command(ctx: commands.Context):
         f"Quantization: {os.getenv('ARGOS_COMPUTE_TYPE', 'auto')}\n"
         f"Languages: TH ↔ EN ↔ KO",
         mention_author=False,
+        allowed_mentions=ALLOWED_MENTIONS,
     )
 
 
@@ -279,11 +288,16 @@ async def reload_command(ctx: commands.Context):
         TWOM_DICTIONARY = load_dictionary()
     except Exception as exc:
         log.exception("Dictionary reload failed")
-        await ctx.reply(f"โหลด TWOM Dictionary ไม่สำเร็จ: `{exc}`", mention_author=False)
+        await ctx.reply(
+            f"โหลด TWOM Dictionary ไม่สำเร็จ: `{exc}`",
+            mention_author=False,
+            allowed_mentions=ALLOWED_MENTIONS,
+        )
         return
     await ctx.reply(
         f"โหลด TWOM Dictionary ใหม่แล้ว ✅ ({len(TWOM_DICTIONARY)} entries)",
         mention_author=False,
+        allowed_mentions=ALLOWED_MENTIONS,
     )
 
 
@@ -314,7 +328,7 @@ async def on_message(message: discord.Message):
 
         # Keep comfortably below Discord's 2000-character message limit.
         if len(response) <= 1900:
-            await message.reply(response, mention_author=False)
+            await message.reply(response, mention_author=False, allowed_mentions=ALLOWED_MENTIONS)
         else:
             chunks = []
             current = ""
@@ -329,14 +343,15 @@ async def on_message(message: discord.Message):
                 chunks.append(current)
             for index, chunk in enumerate(chunks):
                 if index == 0:
-                    await message.reply(chunk, mention_author=False)
+                    await message.reply(chunk, mention_author=False, allowed_mentions=ALLOWED_MENTIONS)
                 else:
-                    await message.channel.send(chunk)
+                    await message.channel.send(chunk, allowed_mentions=ALLOWED_MENTIONS)
     except Exception:
         log.exception("Translation failed")
         await message.reply(
             "JAVIS แปลข้อความนี้ไม่สำเร็จ กรุณาลองใหม่อีกครั้งหรือเช็กว่า Argos models ติดตั้งครบแล้ว",
             mention_author=False,
+            allowed_mentions=ALLOWED_MENTIONS,
         )
 
 

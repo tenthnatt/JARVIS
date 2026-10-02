@@ -50,7 +50,7 @@ for filename, url in models.items():
     path.unlink(missing_ok=True)
 PY
 
-COPY bot.py dictionary.json ./
+COPY bot.py start.py index.html dictionary.json ./
 
 EXPOSE 10000
-CMD ["python", "bot.py"]
+CMD ["python", "start.py"]

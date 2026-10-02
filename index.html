@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JAVIS — TWOM Translator</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background: #0f1115; color: #f3f4f6; }
+    main { max-width: 760px; margin: 10vh auto; padding: 24px; }
+    .card { background: #171a21; border: 1px solid #2a2f3a; border-radius: 16px; padding: 28px; box-shadow: 0 10px 30px rgba(0,0,0,.25); }
+    h1 { margin: 0 0 8px; font-size: 30px; }
+    p { color: #b8c0cc; line-height: 1.6; }
+    .ok { display: inline-flex; padding: 6px 10px; border-radius: 999px; background: #12351f; color: #7ee2a8; font-size: 14px; }
+    code { background: #0c0e12; padding: 2px 6px; border-radius: 6px; }
+    .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-top: 20px; }
+    .item { padding: 14px; background: #11141a; border: 1px solid #252b35; border-radius: 12px; }
+    .label { color: #8f98a8; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+    .value { margin-top: 5px; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card">
+      <span class="ok">● JAVIS ONLINE</span>
+      <h1>JAVIS — TWOM Auto Translator</h1>
+      <p>Discord translation service is running. This page is only a status page; Discord bot behavior remains unchanged.</p>
+      <div class="grid">
+        <div class="item"><div class="label">Languages</div><div class="value">TH ↔ EN ↔ KO</div></div>
+        <div class="item"><div class="label">Engine</div><div class="value">Argos + CTranslate2</div></div>
+        <div class="item"><div class="label">Compute</div><div class="value">CPU / INT8</div></div>
+        <div class="item"><div class="label">Health</div><div class="value"><a href="/health" style="color:inherit">/health</a></div></div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
