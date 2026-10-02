@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>JAVIS — TWOM Translator v1.0.8</title>
+  <title>JAVIS — TWOM Translator v1.0.9</title>
   <style>
     :root { color-scheme: dark; }
     body { margin:0; font-family:system-ui,-apple-system,Segoe UI,sans-serif; background:#0f1115; color:#f3f4f6; }
@@ -28,24 +28,24 @@
   <h1>JAVIS — TWOM Auto Translator</h1>
   <p id="message">กำลังตรวจสอบสถานะบริการ...</p>
   <div class="grid">
-    <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.8</div></div>
+    <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.9</div></div>
     <div class="item"><div class="label">Languages</div><div class="value">TH → EN + KO<br>EN → TH + KO<br>KO → EN + TH</div></div>
     <div class="item"><div class="label">Engine</div><div class="value">Argos + CTranslate2</div></div>
     <div class="item"><div class="label">Runtime Quantization</div><div id="compute" class="value">Checking...</div></div>
     <div class="item"><div class="label">Device</div><div id="device" class="value">Checking...</div></div>
     <div class="item"><div class="label">Batch / Beam</div><div id="batch" class="value">Checking...</div></div>
     <div class="item"><div class="label">Chunking</div><div id="chunk" class="value">Checking...</div></div>
-    <div class="item"><div class="label">Argos Runner</div><div id="worker" class="value">Checking...</div></div>
+    <div class="item"><div class="label">Translation Runner</div><div id="worker" class="value">Checking...</div></div>
     <div class="item"><div class="label">Discord Bot</div><div id="discord" class="value">Checking...</div></div>
     <div class="item"><div class="label">Discord Token</div><div id="token" class="value">Checking...</div></div>
     <div class="item"><div class="label">Mode</div><div class="value">Text-only · Auto Translate</div></div>
-    <div class="item"><div class="label">Health</div><div class="value"><a href="/health" style="color:inherit">/health</a></div></div>
+    <div class="item"><div class="label">Argos Packages</div><div id="packages" class="value small">Checking...</div></div>
   </div>
   <div class="grid" style="margin-top:12px">
     <div class="item"><div class="label">Commands</div><div class="value">!javis status<br>!javis reload<br>!javis help</div></div>
-    <div class="item"><div class="label">Memory Strategy</div><div class="value">Isolated subprocess per target<br>One target model at a time</div></div>
+    <div class="item"><div class="label">Memory Strategy</div><div class="value">Direct CTranslate2 from Argos model<br>One target process at a time</div></div>
     <div class="item"><div class="label">Voice</div><div class="value">Not used · text-only</div></div>
-    <div class="item"><div class="label">Runtime Settings</div><div class="value small">ARGOS_COMPUTE_TYPE=int8 by default; Render Environment can override it.</div></div>
+    <div class="item"><div class="label">Runtime Settings</div><div class="value small">ARGOS_COMPUTE_TYPE=int8 · CPU · Batch=1 enforced</div></div>
   </div>
 </section>
 </main>
@@ -61,15 +61,16 @@ async function refreshStatus() {
     document.getElementById('device').textContent=d.device_type || 'unknown';
     document.getElementById('batch').textContent=`${d.batch_size ?? '?'} / ${d.beam_size ?? '?'}`;
     document.getElementById('chunk').textContent=d.chunk_type || 'unknown';
-    document.getElementById('worker').textContent=d.translation_worker_alive ? `READY ✅ (${d.translation_runner_mode || 'isolated'})` : 'OFFLINE ❌';
+    document.getElementById('worker').textContent=d.translation_worker_alive ? `READY ✅ (${d.translation_runner_mode || 'direct'})` : 'OFFLINE ❌';
+    document.getElementById('packages').textContent=d.argos_packages_dir || 'default';
     document.getElementById('token').textContent=d.discord_token_configured ? 'Configured ✅' : 'Missing ❌';
     document.getElementById('discord').textContent=d.discord_ready ? 'Connected ✅' : 'Not connected ❌';
     if(d.ok && d.translation_worker_alive && d.discord_ready){
       badge.textContent='● JAVIS ONLINE'; badge.className='ok';
-      message.textContent='Discord + Argos worker are running. Runtime quantization and one-target-at-a-time memory mode are active.';
+      message.textContent='Discord + Translation worker are running. Runtime INT8 + direct CTranslate2 runner are active.';
     } else {
       badge.textContent='● CONFIGURATION / WORKER CHECK'; badge.className='ok warn';
-      message.textContent='ตรวจสอบสถานะ Discord token, Discord Gateway และ Argos worker ที่ /health';
+      message.textContent='ตรวจสอบสถานะ Discord token, Discord Gateway และ Translation worker ที่ /health';
     }
   } catch(e){
     badge.textContent='● HEALTH CHECK FAILED'; badge.className='ok warn';

@@ -16,7 +16,7 @@ from discord.ext import commands
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.8")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.9")
 
 PORT = int(os.getenv("PORT", "10000"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "1200"))
@@ -31,6 +31,10 @@ os.environ.setdefault("ARGOS_INTER_THREADS", "1")
 os.environ.setdefault("ARGOS_INTRA_THREADS", "1")
 os.environ.setdefault("ARGOS_BATCH_SIZE", "1")
 os.environ.setdefault("ARGOS_BEAM_SIZE", "2")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # Render Free is a 512 MB RAM plan. If a Render Environment Variable
 # overrides batch size above 1, clamp it back to 1 to reduce peak RAM.
@@ -38,10 +42,13 @@ try:
     _runtime_batch = int(os.getenv("ARGOS_BATCH_SIZE", "1"))
 except ValueError:
     _runtime_batch = 1
-if _runtime_batch > 1:
-    os.environ["ARGOS_BATCH_SIZE"] = "1"
+os.environ["ARGOS_BATCH_SIZE"] = "1"
 
 os.environ.setdefault("ARGOS_CHUNK_TYPE", "MINISBD")
+os.environ.setdefault(
+    "ARGOS_PACKAGES_DIR",
+    os.path.join(os.path.expanduser("~"), ".local", "share", "argos-translate", "packages"),
+)
 os.environ.setdefault(
     "ARGOS_PACKAGE_INDEX",
     "https://raw.githubusercontent.com/argosopentech/argospm-index/main",
@@ -200,6 +207,122 @@ import json
 import os
 import sys
 import traceback
+from pathlib import Path
+
+def _package_roots():
+    roots = []
+    env_root = os.getenv("ARGOS_PACKAGES_DIR", "").strip()
+    if env_root:
+        roots.append(Path(env_root))
+    home = Path.home()
+    roots.extend([
+        home / ".local" / "share" / "argos-translate" / "packages",
+        Path("/root/.local/share/argos-translate/packages"),
+        Path("/app/.local/share/argos-translate/packages"),
+        Path("/usr/local/share/argos-translate/packages"),
+    ])
+    seen = set()
+    out = []
+    for root in roots:
+        try:
+            key = str(root.resolve())
+        except Exception:
+            key = str(root)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(root)
+    return out
+
+def _find_package(source_code, target_code):
+    wanted = (source_code, target_code)
+    for root in _package_roots():
+        if not root.exists():
+            continue
+        try:
+            metadata_files = list(root.glob("*/metadata.json"))
+        except Exception:
+            metadata_files = []
+        for meta_path in metadata_files:
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if meta.get("type", "translate") != "translate":
+                continue
+            if (meta.get("from_code"), meta.get("to_code")) == wanted:
+                return meta_path.parent
+    return None
+
+def _translate_direct(package_dir, text):
+    # Import only the lightweight runtime pieces needed for one model.
+    # Do NOT import argostranslate.translate here: that pulls the full
+    # Argos registry/SBD stack into the translation subprocess.
+    import ctranslate2
+    import sentencepiece as spm
+
+    model_dir = package_dir / "model"
+    sp_model = package_dir / "sentencepiece.model"
+    bpe_model = package_dir / "bpe.model"
+
+    if not model_dir.is_dir():
+        raise RuntimeError(f"Argos model directory not found: {model_dir}")
+    if not sp_model.exists() and not bpe_model.exists():
+        raise RuntimeError(
+            f"Tokenizer model not found in Argos package: {package_dir}"
+        )
+    if not sp_model.exists():
+        raise RuntimeError(
+            "This JAVIS runtime expects Argos SentencePiece packages; "
+            f"no sentencepiece.model found in {package_dir}"
+        )
+
+    tokenizer = spm.SentencePieceProcessor(model_file=str(sp_model))
+    source_tokens = tokenizer.encode(text, out_type=str)
+    if not source_tokens:
+        return ""
+
+    compute_type = os.getenv("ARGOS_COMPUTE_TYPE", "int8")
+    device = os.getenv("ARGOS_DEVICE_TYPE", "cpu")
+    try:
+        inter_threads = max(1, int(os.getenv("ARGOS_INTER_THREADS", "1")))
+    except ValueError:
+        inter_threads = 1
+    try:
+        intra_threads = max(1, int(os.getenv("ARGOS_INTRA_THREADS", "1")))
+    except ValueError:
+        intra_threads = 1
+    try:
+        beam_size = max(1, int(os.getenv("ARGOS_BEAM_SIZE", "2")))
+    except ValueError:
+        beam_size = 2
+
+    # CTranslate2 is the actual inference engine used by Argos models.
+    # Loading it directly avoids importing the larger Argos registry/SBD
+    # runtime inside the short-lived process, reducing memory pressure.
+    params = {
+        "model_path": str(model_dir),
+        "device": device,
+        "inter_threads": inter_threads,
+        "intra_threads": intra_threads,
+    }
+    if compute_type and compute_type != "auto":
+        params["compute_type"] = compute_type
+
+    translator = ctranslate2.Translator(**params)
+    try:
+        results = translator.translate_batch(
+            [source_tokens],
+            beam_size=beam_size,
+            max_batch_size=1,
+            return_scores=False,
+        )
+        if not results or not results[0].hypotheses:
+            raise RuntimeError("CTranslate2 returned no hypothesis")
+        target_tokens = results[0].hypotheses[0]
+        return tokenizer.decode(target_tokens)
+    finally:
+        del translator
+        del tokenizer
 
 def main():
     payload = json.loads(sys.stdin.read())
@@ -208,35 +331,23 @@ def main():
     text = payload["text"]
 
     try:
-        import argostranslate.translate as argos_translate
-
-        installed = argos_translate.get_installed_languages()
-        from_lang = next((lang for lang in installed if lang.code == source_lang), None)
-        to_lang = next((lang for lang in installed if lang.code == target_lang), None)
-
-        if from_lang is None or to_lang is None:
+        package_dir = _find_package(source_lang, target_lang)
+        if package_dir is None:
             raise RuntimeError(
-                f"Argos language unavailable: {source_lang}->{target_lang}"
+                f"Installed Argos model package not found: "
+                f"{source_lang}->{target_lang}"
             )
 
-        translation = from_lang.get_translation(to_lang)
-        if translation is None:
-            routes = []
-            for lang in installed:
-                for candidate in getattr(lang, "translations_from", []):
-                    routes.append(
-                        f"{candidate.from_lang.code}->{candidate.to_lang.code}"
-                    )
-            raise RuntimeError(
-                f"Argos translation route unavailable: "
-                f"{source_lang}->{target_lang}; "
-                f"installed routes: {', '.join(sorted(set(routes))) or 'none'}"
-            )
-
-        result = translation.translate(text)
+        result = _translate_direct(package_dir, text)
         print(
             json.dumps(
-                {"ok": True, "result": str(result)},
+                {
+                    "ok": True,
+                    "result": str(result),
+                    "runner": "ct2-direct-from-argos-model",
+                    "source": source_lang,
+                    "target": target_lang,
+                },
                 ensure_ascii=False,
             )
         )
@@ -254,11 +365,12 @@ if __name__ == "__main__":
     main()
 """
 
+
 class ArgosWorkerClient:
-    """Compatibility wrapper around an isolated one-shot Argos subprocess.
+    """Compatibility wrapper around an isolated one-shot CTranslate2 subprocess using an Argos model artifact.
 
     The previous v1.0.7 long-lived worker kept the Python/Argos runtime resident
-    under the same Render cgroup. v1.0.8 exits the subprocess after every target,
+    under the same Render cgroup. v1.0.9 exits the subprocess after every target,
     so its CTranslate2 memory is returned to the OS before the next target.
     """
 
@@ -392,36 +504,64 @@ def translate_all_sync(original: str) -> dict[str, str]:
     clean = strip_language_prefix(original).strip()
 
     if not clean:
-        return {"source": source_lang, "en": "", "th": "", "ko": ""}
+        return {"source": source_lang, "en": "", "th": "", "ko": "", "errors": {}}
 
     log.info("Translating message | source=%s | chars=%d", source_lang, len(clean))
 
-    if source_lang == "en":
-        targets = {
-            "th": translate_sync(clean, "en", "th"),
-            "ko": translate_sync(clean, "en", "ko"),
-        }
-    elif source_lang == "th":
-        targets = {
-            "en": translate_sync(clean, "th", "en"),
-            "ko": translate_sync(clean, "en", "ko"),
-        }
-    else:
-        targets = {
-            "en": translate_sync(clean, "ko", "en"),
-            "th": translate_sync(clean, "en", "th"),
-        }
+    targets: dict[str, str] = {}
+    errors: dict[str, str] = {}
 
-    return {"source": source_lang, **targets}
+    def run_target(label: str, source: str, target: str) -> None:
+        try:
+            targets[label] = translate_sync(clean, source, target)
+        except Exception as exc:
+            errors[f"{source}->{target}"] = str(exc)
+            log.exception("Target translation failed | %s->%s", source, target)
+
+    if source_lang == "en":
+        run_target("th", "en", "th")
+        run_target("ko", "en", "ko")
+    elif source_lang == "th":
+        run_target("en", "th", "en")
+        # Important: always feed the original clean text to EN->KO.
+        # This preserves the user's requested English pivot behavior.
+        run_target("ko", "en", "ko")
+    else:
+        run_target("en", "ko", "en")
+        run_target("th", "en", "th")
+
+    return {"source": source_lang, **targets, "errors": errors}
 
 
 def build_response(result: dict[str, str]) -> str:
     source = result["source"]
+    errors = result.get("errors", {})
+    lines = []
+
     if source == "th":
-        return f"[EN] {result['en']}\n[KO] {result['ko']}"
-    if source == "en":
-        return f"[TH] {result['th']}\n[KO] {result['ko']}"
-    return f"[EN] {result['en']}\n[TH] {result['th']}"
+        if result.get("en"):
+            lines.append(f"[EN] {result['en']}")
+        if result.get("ko"):
+            lines.append(f"[KO] {result['ko']}")
+    elif source == "en":
+        if result.get("th"):
+            lines.append(f"[TH] {result['th']}")
+        if result.get("ko"):
+            lines.append(f"[KO] {result['ko']}")
+    else:
+        if result.get("en"):
+            lines.append(f"[EN] {result['en']}")
+        if result.get("th"):
+            lines.append(f"[TH] {result['th']}")
+
+    if errors and lines:
+        log.warning("Partial translation response | errors=%s", errors)
+    if not lines:
+        raise RuntimeError(
+            "No translation target completed successfully: "
+            + (json.dumps(errors, ensure_ascii=False) if errors else "unknown error")
+        )
+    return "\n".join(lines)
 
 
 async def index(request: web.Request) -> web.Response:
@@ -443,7 +583,8 @@ async def health(request: web.Request) -> web.Response:
             "batch_size": int(os.getenv("ARGOS_BATCH_SIZE", "1")),
             "beam_size": int(os.getenv("ARGOS_BEAM_SIZE", "2")),
             "translation_worker_alive": worker_alive,
-            "translation_runner_mode": "subprocess-per-target",
+            "translation_runner_mode": "ct2-direct-from-argos-model-per-target",
+            "argos_packages_dir": os.getenv("ARGOS_PACKAGES_DIR", ""),
             "discord_token_configured": token_configured,
             "discord_ready": bot.is_ready(),
         },
