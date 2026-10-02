@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>JAVIS — TWOM Translator v1.0.4</title>
+  <title>JAVIS — TWOM Translator v1.0.5</title>
   <style>
     :root { color-scheme: dark; }
     body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background: #0f1115; color: #f3f4f6; }
@@ -27,7 +27,7 @@
       <h1>JAVIS — TWOM Auto Translator</h1>
       <p id="message">กำลังตรวจสอบสถานะบริการ...</p>
       <div class="grid">
-        <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.4</div></div>
+        <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.5</div></div>
         <div class="item"><div class="label">Languages</div><div class="value">TH ↔ EN ↔ KO</div></div>
         <div class="item"><div class="label">Engine</div><div class="value">Argos + CTranslate2</div></div>
         <div class="item"><div class="label">Compute</div><div class="value">CPU / INT8</div></div>
@@ -35,7 +35,7 @@
         <div class="item"><div class="label">Discord Token</div><div id="token" class="value">Checking...</div></div>
         <div class="item"><div class="label">Discord Bot</div><div id="discord" class="value">Checking...</div></div>
         <div class="item"><div class="label">Health</div><div class="value"><a href="/health" style="color:inherit">/health</a></div></div>
-        <div class="item"><div class="label">Mode</div><div class="value">Text-only (no Voice)</div></div>
+        <div class="item"><div class="label">Mode</div><div class="value">Text-only · Auto Translate</div></div>
       </div>
       <div class="grid" style="margin-top:12px">
         <div class="item"><div class="label">Commands</div><div class="value">!javis status<br>!javis reload<br>!javis help</div></div>
@@ -57,7 +57,7 @@ async function refreshStatus() {
   try {
     const res = await fetch('/health', { cache: 'no-store' });
     const data = await res.json();
-    version.textContent = data.version ? `v${data.version}` : 'v1.0.4';
+    version.textContent = data.version ? `v${data.version}` : 'v1.0.5';
     chunk.textContent = data.chunk_type || 'unknown';
     pairs.textContent = (data.cached_translation_pairs && data.cached_translation_pairs.length) ? data.cached_translation_pairs.join(', ') : 'lazy load';
     token.textContent = data.discord_token_configured ? 'Configured ✅' : 'Missing ❌';

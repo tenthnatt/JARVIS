@@ -14,7 +14,7 @@ DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
 
 # Release version for this deploy. Keep this value in sync with the copy-ready filenames.
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.4")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.5")
 
 def get_discord_token() -> str:
     """Read the Discord bot token only from environment variables.
@@ -39,7 +39,7 @@ os.environ.setdefault("ARGOS_INTER_THREADS", "1")
 os.environ.setdefault("ARGOS_INTRA_THREADS", "1")
 os.environ.setdefault("ARGOS_BATCH_SIZE", "8")
 os.environ.setdefault("ARGOS_BEAM_SIZE", "2")
-os.environ.setdefault("ARGOS_CHUNK_TYPE", "NONE")
+os.environ["ARGOS_CHUNK_TYPE"] = "MINISBD"
 os.environ.setdefault(
     "ARGOS_PACKAGE_INDEX",
     "https://raw.githubusercontent.com/argosopentech/argospm-index/main",
@@ -237,12 +237,34 @@ def translate_sync(text: str, source_lang: str, target_lang: str) -> str:
     cache_key = (source_lang, target_lang)
     translator = TRANSLATOR_CACHE.get(cache_key)
     if translator is None:
-        # This function is called from a worker thread, so use a small
-        # thread-safe critical section without blocking the Discord event loop.
-        # Multiple calls are serialized by TRANSLATION_LOCK in on_message.
-        translator = argos_translate.get_translation_from_codes(source_lang, target_lang)
+        # Argos 1.11.0 needs a supported sentence-boundary strategy when
+        # constructing PackageTranslation. We force MiniSBD above because
+        # ARGOS_CHUNK_TYPE=NONE is still marked unsupported internally.
+        # Resolve the installed language objects directly and retry once after
+        # clearing Argos's language cache in case a stale cache is present.
+        installed = argos_translate.get_installed_languages()
+        from_lang = next((lang for lang in installed if lang.code == source_lang), None)
+        to_lang = next((lang for lang in installed if lang.code == target_lang), None)
+        translator = from_lang.get_translation(to_lang) if from_lang and to_lang else None
+
         if translator is None:
-            raise RuntimeError(f"Argos translation model unavailable: {source_lang}->{target_lang}")
+            argos_translate.get_installed_languages.cache_clear()
+            installed = argos_translate.get_installed_languages()
+            from_lang = next((lang for lang in installed if lang.code == source_lang), None)
+            to_lang = next((lang for lang in installed if lang.code == target_lang), None)
+            translator = from_lang.get_translation(to_lang) if from_lang and to_lang else None
+
+        if translator is None:
+            installed_pairs = []
+            for lang in installed:
+                for candidate in getattr(lang, "translations_from", []):
+                    installed_pairs.append(f"{candidate.from_lang.code}->{candidate.to_lang.code}")
+            pairs = ", ".join(sorted(set(installed_pairs))) or "none"
+            raise RuntimeError(
+                f"Argos translation route unavailable: {source_lang}->{target_lang}; "
+                f"installed routes: {pairs}"
+            )
+
         TRANSLATOR_CACHE[cache_key] = translator
 
     result = translator.translate(prepared)
@@ -301,7 +323,7 @@ async def health(request: web.Request) -> web.Response:
             "version": JAVIS_VERSION,
             "engine": "Argos Translate + CTranslate2",
             "compute_type": os.getenv("ARGOS_COMPUTE_TYPE", "auto"),
-            "chunk_type": os.getenv("ARGOS_CHUNK_TYPE", "DEFAULT"),
+            "chunk_type": os.getenv("ARGOS_CHUNK_TYPE", "MINISBD"),
             "cached_translation_pairs": [f"{src}->{dst}" for src, dst in sorted(TRANSLATOR_CACHE)],
             "discord_token_configured": token_configured,
             "discord_ready": bot.is_ready(),
@@ -345,7 +367,7 @@ async def status_command(ctx: commands.Context):
         f"Version: v{JAVIS_VERSION}\n"
         f"Engine: Argos Translate + CTranslate2\n"
         f"Quantization: {os.getenv('ARGOS_COMPUTE_TYPE', 'auto')}\n"
-        f"Chunking: {os.getenv('ARGOS_CHUNK_TYPE', 'DEFAULT')}\n"
+        f"Chunking: {os.getenv('ARGOS_CHUNK_TYPE', 'MINISBD')}\n"
         f"Languages: TH ↔ EN ↔ KO",
         mention_author=False,
         allowed_mentions=ALLOWED_MENTIONS,
@@ -435,7 +457,7 @@ async def on_message(message: discord.Message):
     except Exception:
         log.exception("Translation failed")
         await message.reply(
-            "JAVIS แปลข้อความนี้ไม่สำเร็จ กรุณาลองใหม่อีกครั้งหรือเช็กว่า Argos models ติดตั้งครบแล้ว",
+            "JAVIS แปลข้อความนี้ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง",
             mention_author=False,
             allowed_mentions=ALLOWED_MENTIONS,
         )
@@ -453,7 +475,7 @@ async def main():
         "Starting JAVIS v%s | Engine=Argos Translate + CTranslate2 | Compute=%s | Chunk=%s | Port=%s",
         JAVIS_VERSION,
         os.getenv("ARGOS_COMPUTE_TYPE", "auto"),
-        os.getenv("ARGOS_CHUNK_TYPE", "DEFAULT"),
+        os.getenv("ARGOS_CHUNK_TYPE", "MINISBD"),
         PORT,
     )
     runner = await start_http_server()
