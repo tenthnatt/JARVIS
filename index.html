@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>JAVIS — TWOM Translator v1.0.17</title>
+  <title>JAVIS — TWOM Translator v1.0.18</title>
   <style>
     :root { color-scheme: dark; }
     body { margin:0; font-family:system-ui,-apple-system,Segoe UI,sans-serif; background:#0f1115; color:#f3f4f6; }
@@ -28,7 +28,7 @@
   <h1>JAVIS — TWOM Auto Translator</h1>
   <p id="message">กำลังตรวจสอบสถานะบริการ...</p>
   <div class="grid">
-    <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.17</div></div>
+    <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.18</div></div>
     <div class="item"><div class="label">Languages</div><div class="value">TH → EN + KO<br>EN → TH + KO<br>KO → EN + TH</div></div>
     <div class="item"><div class="label">Engine</div><div class="value">Argos + CTranslate2</div></div>
     <div class="item"><div class="label">Runtime Quantization</div><div id="compute" class="value">Checking...</div></div>
@@ -38,6 +38,8 @@
     <div class="item"><div class="label">Chunking</div><div id="chunk" class="value">Checking...</div></div>
     <div class="item"><div class="label">Translation Runner</div><div id="worker" class="value">Checking...</div></div>
     <div class="item"><div class="label">Discord Bot</div><div id="discord" class="value">Checking...</div></div>
+    <div class="item"><div class="label">Discord Login</div><div id="loginstate" class="value">Checking...</div></div>
+    <div class="item"><div class="label">Login Retries</div><div id="loginretries" class="value">Checking...</div></div>
     <div class="item"><div class="label">Discord Token</div><div id="token" class="value">Checking...</div></div>
     <div class="item"><div class="label">Mode</div><div class="value">Text-only · Auto Translate</div></div>
     <div class="item"><div class="label">Argos Packages</div><div id="packages" class="value small">Checking...</div></div>
@@ -76,12 +78,19 @@ async function refreshStatus() {
     document.getElementById('packages').textContent=d.argos_packages_dir || 'default';
     document.getElementById('token').textContent=d.discord_token_configured ? 'Configured ✅' : 'Missing ❌';
     document.getElementById('discord').textContent=d.discord_ready ? 'Connected ✅' : 'Not connected ❌';
+    document.getElementById('loginstate').textContent=d.discord_login_state || 'unknown';
+    document.getElementById('loginretries').textContent=`${d.discord_login_retry_count ?? 0}`;
     if(d.ok && d.translation_worker_alive && d.discord_ready){
       badge.textContent='● JAVIS ONLINE'; badge.className='ok';
       message.textContent=`Discord + Translation worker are running. Non-translatable content mode: ${d.non_translatable_mode || 'preserved'}.`;
     } else {
       badge.textContent='● CONFIGURATION / WORKER CHECK'; badge.className='ok warn';
-      message.textContent='ตรวจสอบสถานะ Discord token, Discord Gateway และ Translation worker ที่ /health';
+      if(d.discord_login_state === 'rate_limited_waiting' || d.discord_login_state === 'retrying'){
+        const wait = Number(d.discord_login_retry_after || 0);
+        message.textContent = `Discord API จำกัดอัตราชั่วคราว — JAVIS จะรอตาม retry_after แล้วเชื่อมต่อใหม่เอง (เหลือประมาณ ${wait.toFixed(1)} วินาที)`;
+      } else {
+        message.textContent='ตรวจสอบสถานะ Discord token, Discord Gateway และ Translation worker ที่ /health';
+      }
     }
   } catch(e){
     badge.textContent='● HEALTH CHECK FAILED'; badge.className='ok warn';
