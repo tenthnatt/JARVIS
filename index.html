@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>JAVIS — TWOM Translator v1.0.22</title>
+  <title>JAVIS — TWOM Translator v1.0.24</title>
   <style>
     :root { color-scheme: dark; }
     body { margin:0; font-family:system-ui,-apple-system,Segoe UI,sans-serif; background:#0f1115; color:#f3f4f6; }
@@ -28,7 +28,7 @@
   <h1>JAVIS — TWOM Auto Translator</h1>
   <p id="message">กำลังตรวจสอบสถานะบริการ...</p>
   <div class="grid">
-    <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.22</div></div>
+    <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.24</div></div>
     <div class="item"><div class="label">Languages</div><div class="value">TH → EN + KO<br>EN → TH + KO<br>KO → EN + TH</div></div>
     <div class="item"><div class="label">Engine</div><div class="value">Argos + CTranslate2</div></div>
     <div class="item"><div class="label">Runtime Quantization</div><div id="compute" class="value">Checking...</div></div>
@@ -41,6 +41,7 @@
     <div class="item"><div class="label">Discord Login</div><div id="loginstate" class="value">Checking...</div></div>
     <div class="item"><div class="label">Login Retries</div><div id="loginretries" class="value">Checking...</div></div>
     <div class="item"><div class="label">Session Recovery</div><div id="sessionrecovery" class="value">Checking...</div></div>
+    <div class="item"><div class="label">HTTP Client Rebuild</div><div id="httprebuild" class="value">Checking...</div></div>
     <div class="item"><div class="label">Retry After</div><div id="retryafter" class="value">Checking...</div></div>
     <div class="item"><div class="label">Outbound REST Cooldown</div><div id="outboundcooldown" class="value">Checking...</div></div>
     <div class="item"><div class="label">Last Outbound 429</div><div id="outboundcontext" class="value">Checking...</div></div>
@@ -89,6 +90,7 @@ async function refreshStatus() {
     document.getElementById('loginstate').textContent=d.discord_login_state || 'unknown';
     document.getElementById('loginretries').textContent=`${d.discord_login_retry_count ?? 0}`;
     document.getElementById('sessionrecovery').textContent=`${d.discord_login_session_recovery_count ?? 0}`;
+    if(document.getElementById('httprebuild')) document.getElementById('httprebuild').textContent=`${d.discord_login_http_rebuild_count ?? 0}`;
     document.getElementById('retryafter').textContent=`${Number(d.discord_login_retry_after || 0).toFixed(1)}s`;
     document.getElementById('outboundcooldown').textContent=`${Number(d.discord_outbound_block_retry_after || 0).toFixed(1)}s`;
     document.getElementById('outboundcontext').textContent=d.discord_outbound_last_429_context || 'none';

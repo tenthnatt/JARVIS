@@ -17,7 +17,7 @@ from discord.ext import commands
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.22")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.24")
 
 PORT = int(os.getenv("PORT", "10000"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "1200"))
@@ -699,6 +699,7 @@ DISCORD_LOGIN_STATE = "starting"
 DISCORD_LOGIN_RETRY_COUNT = 0
 DISCORD_LOGIN_RETRY_AFTER = 0.0
 DISCORD_LOGIN_SESSION_RECOVERY_COUNT = 0
+DISCORD_LOGIN_HTTP_REBUILD_COUNT = 0
 
 # Render zero-downtime deploys start a new instance before SIGTERM-ing the old one.
 # Delay only the FIRST Discord login attempt so the old Gateway has time to hand over.
@@ -883,6 +884,7 @@ async def health(request: web.Request) -> web.Response:
             "korean_beam_size": int(os.getenv("ARGOS_KO_BEAM_SIZE", "4")),
             "translation_worker_alive": worker_alive,
             "translation_runner_mode": "ct2-direct-argos-compatible-v1.0.20-per-target",
+            "discord_session_recovery_mode": "fresh-httpclient-object-after-login-transport-failure",
             "quality_mode": "argos-compatible-decode-pieces+raw-target-prefix+pivot-fix+twom-span-glossary",
             "decode_mode": "SentencePiece.decode_pieces + U+2581 normalization + no-TWOM-placeholders",
             "pivot_mode": "th->en->ko and ko->en->th",
@@ -895,6 +897,7 @@ async def health(request: web.Request) -> web.Response:
             "discord_login_retry_count": DISCORD_LOGIN_RETRY_COUNT,
             "discord_login_retry_after": DISCORD_LOGIN_RETRY_AFTER,
             "discord_login_session_recovery_count": DISCORD_LOGIN_SESSION_RECOVERY_COUNT,
+            "discord_login_http_rebuild_count": DISCORD_LOGIN_HTTP_REBUILD_COUNT,
             "discord_startup_handover_delay_seconds": DISCORD_STARTUP_HANDOVER_DELAY_SECONDS,
             "discord_shutdown_requested": DISCORD_SHUTDOWN_REQUESTED,
             "discord_login_last_status": DISCORD_LOGIN_LAST_STATUS,
@@ -1333,19 +1336,71 @@ def _discord_retry_after_seconds(exc: object, fallback_seconds: float) -> tuple[
 
 
 async def _reset_discord_client_state_after_login_error(reason: str) -> None:
-    """Reset failed-login client state without closing a healthy HTTP session.
-
-    A 429 response itself does not require closing discord.py's aiohttp session.
-    Closing that session and then trying to reuse the same Client can leave the
-    next static_login() with a closed-session RuntimeError. Client.clear() is
-    the supported way in discord.py to reopen/reset client state after a failed
-    start attempt, and its HTTP clear() only replaces an already-closed session.
-    """
+    """Reset discord.py client state after a failed login attempt."""
     try:
         bot.clear()
         log.info("Discord client state reset after login error | reason=%s", reason)
     except Exception:
         log.exception("Discord client state reset after login error failed | reason=%s", reason)
+
+
+async def _rebuild_discord_http_client(reason: str) -> None:
+    """Replace the discord.py HTTPClient object after a failed login transport.
+
+    v1.0.22 closed bot.http and then reused the same HTTPClient object.  In the
+    production log, the next static_login() still reached an already-closed
+    aiohttp ClientSession and entered a permanent ``Session is closed`` loop.
+
+    discord.py constructs HTTPClient lazily around a ClientSession. Replacing the
+    HTTPClient object itself is safer than trying to resurrect its private session
+    state. This function performs only local transport cleanup; it sends no Discord
+    request.
+    """
+    global DISCORD_LOGIN_HTTP_REBUILD_COUNT
+
+    old_http = getattr(bot, "http", None)
+    loop = asyncio.get_running_loop()
+
+    # Preserve supported HTTPClient configuration where available. Do not reuse
+    # the old connector/session after a transport failure.
+    proxy = getattr(old_http, "proxy", None)
+    proxy_auth = getattr(old_http, "proxy_auth", None)
+    http_trace = getattr(old_http, "http_trace", None)
+    max_ratelimit_timeout = getattr(old_http, "max_ratelimit_timeout", None)
+    use_clock = bool(getattr(old_http, "use_clock", False))
+
+    if old_http is not None:
+        try:
+            await old_http.close()
+        except Exception:
+            log.exception("Failed to close old Discord HTTP client | reason=%s", reason)
+
+    try:
+        from discord.http import HTTPClient
+
+        try:
+            new_http = HTTPClient(
+                loop,
+                None,
+                proxy=proxy,
+                proxy_auth=proxy_auth,
+                unsync_clock=not use_clock,
+                http_trace=http_trace,
+                max_ratelimit_timeout=max_ratelimit_timeout,
+            )
+        except TypeError:
+            # Compatibility fallback for an older discord.py constructor.
+            new_http = HTTPClient(loop, None, proxy=proxy, proxy_auth=proxy_auth)
+        bot.http = new_http
+        DISCORD_LOGIN_HTTP_REBUILD_COUNT += 1
+        log.info(
+            "Discord HTTP client object rebuilt | rebuild_count=%d | reason=%s | fresh_session=deferred_until_login",
+            DISCORD_LOGIN_HTTP_REBUILD_COUNT,
+            reason,
+        )
+    except Exception:
+        log.exception("Discord HTTP client rebuild failed | reason=%s", reason)
+        raise
 
 
 def _discord_http_429_diagnostics(exc: Exception) -> dict[str, object]:
@@ -1511,15 +1566,12 @@ async def _start_discord_with_rate_limit_retry(discord_token: str) -> None:
                     diag.get("text") or "-",
                 )
 
-                # Respect Retry-After and dispose of the failed login HTTP session.
-                # Closing alone is unsafe because a later static_login() could reuse
-                # a closed aiohttp session. close + Client.clear() gives discord.py
-                # a clean HTTP session for the next allowed login attempt.
-                try:
-                    await bot.http.close()
-                except Exception:
-                    log.exception("Failed to close Discord HTTP session after login 429")
-                await _reset_discord_client_state_after_login_error("http-429-session-reset")
+                # Respect Retry-After and rebuild the HTTPClient object locally.
+                # The previous v1.0.22 flow closed bot.http and reused the same
+                # HTTPClient object, which produced a persistent Session is closed
+                # loop when the cooldown expired. Rebuilding the object sends no HTTP.
+                await _rebuild_discord_http_client("http-429")
+                await _reset_discord_client_state_after_login_error("http-429-httpclient-rebuild")
                 try:
                     await asyncio.wait_for(DISCORD_SHUTDOWN_EVENT.wait(), timeout=wait_seconds)
                     DISCORD_LOGIN_STATE = "shutdown_requested"
@@ -1542,11 +1594,8 @@ async def _start_discord_with_rate_limit_retry(discord_token: str) -> None:
                     DISCORD_LOGIN_SESSION_RECOVERY_COUNT,
                     wait_seconds,
                 )
-                try:
-                    await bot.http.close()
-                except Exception:
-                    pass
-                await _reset_discord_client_state_after_login_error("closed-session")
+                await _rebuild_discord_http_client("closed-session")
+                await _reset_discord_client_state_after_login_error("closed-session-httpclient-rebuild")
                 try:
                     await asyncio.wait_for(DISCORD_SHUTDOWN_EVENT.wait(), timeout=wait_seconds)
                     DISCORD_LOGIN_STATE = "shutdown_requested"
