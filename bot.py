@@ -16,7 +16,7 @@ from discord.ext import commands
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.14")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.15")
 
 PORT = int(os.getenv("PORT", "10000"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "1200"))
@@ -276,6 +276,7 @@ import sys
 import traceback
 from pathlib import Path
 
+
 def _package_roots():
     roots = []
     env_root = os.getenv("ARGOS_PACKAGES_DIR", "").strip()
@@ -300,6 +301,7 @@ def _package_roots():
             out.append(root)
     return out
 
+
 def _find_package(source_code, target_code):
     wanted = (source_code, target_code)
     for root in _package_roots():
@@ -317,45 +319,23 @@ def _find_package(source_code, target_code):
             if meta.get("type", "translate") != "translate":
                 continue
             if (meta.get("from_code"), meta.get("to_code")) == wanted:
-                return meta_path.parent
-    return None
+                return meta_path.parent, meta
+    return None, None
 
-def _translate_korean_native(source_code, target_code, text):
-    # Optional Korean native path. v1.0.11 defaults to direct CTranslate2 for
-    # Korean because the previous native path could stall/restart the Render
-    # service before the Discord response was sent. Keep this code path only
-    # as an explicit opt-in via ARGOS_KO_ENGINE=argos-native.
-    # The subprocess still exits after one target, so CTranslate2 memory is
-    # returned before the next target.
-    os.environ["ARGOS_BATCH_SIZE"] = "1"
-    os.environ["ARGOS_BEAM_SIZE"] = os.getenv("ARGOS_KO_BEAM_SIZE", "4")
-    os.environ["ARGOS_CHUNK_TYPE"] = os.getenv("ARGOS_CHUNK_TYPE", "MINISBD")
-    import argostranslate.translate as argos_translate
-    translation = argos_translate.get_translation_from_codes(source_code, target_code)
-    if translation is None:
-        raise RuntimeError(f"Argos native translation unavailable: {source_code}->{target_code}")
-    result = translation.translate(text)
-    if not isinstance(result, str) or not result.strip():
-        raise RuntimeError(f"Argos native returned empty translation: {source_code}->{target_code}")
-    return result.strip()
 
-def _translate_direct(package_dir, text):
-    # Import only the lightweight runtime pieces needed for one model.
-    # Do NOT import argostranslate.translate here: that pulls the full
-    # Argos registry/SBD stack into the translation subprocess.
+def _translate_direct(package_dir, metadata, texts):
+    # This follows the important decoding behavior used by Argos Translate's
+    # PackageTranslation while keeping the subprocess lightweight: package
+    # tokenizer + optional target_prefix + replace_unknowns + token batching +
+    # length_penalty=0.2 are preserved, but the full Argos registry/SBD stack is
+    # not imported into the worker. See Argos PackageTranslation source.
     import ctranslate2
     import sentencepiece as spm
 
     model_dir = package_dir / "model"
     sp_model = package_dir / "sentencepiece.model"
-    bpe_model = package_dir / "bpe.model"
-
     if not model_dir.is_dir():
         raise RuntimeError(f"Argos model directory not found: {model_dir}")
-    if not sp_model.exists() and not bpe_model.exists():
-        raise RuntimeError(
-            f"Tokenizer model not found in Argos package: {package_dir}"
-        )
     if not sp_model.exists():
         raise RuntimeError(
             "This JAVIS runtime expects Argos SentencePiece packages; "
@@ -363,9 +343,9 @@ def _translate_direct(package_dir, text):
         )
 
     tokenizer = spm.SentencePieceProcessor(model_file=str(sp_model))
-    source_tokens = tokenizer.encode(text, out_type=str)
-    if not source_tokens:
-        return ""
+    tokenized = [tokenizer.encode(text, out_type=str) for text in texts]
+    if not tokenized:
+        return []
 
     compute_type = os.getenv("ARGOS_COMPUTE_TYPE", "int8")
     device = os.getenv("ARGOS_DEVICE_TYPE", "cpu")
@@ -378,13 +358,14 @@ def _translate_direct(package_dir, text):
     except ValueError:
         intra_threads = 1
     try:
+        batch_size = max(1, int(os.getenv("ARGOS_BATCH_SIZE", "1")))
+    except ValueError:
+        batch_size = 1
+    try:
         beam_size = max(1, int(os.getenv("ARGOS_BEAM_SIZE", "2")))
     except ValueError:
         beam_size = 2
 
-    # CTranslate2 is the actual inference engine used by Argos models.
-    # Loading it directly avoids importing the larger Argos registry/SBD
-    # runtime inside the short-lived process, reducing memory pressure.
     params = {
         "model_path": str(model_dir),
         "device": device,
@@ -396,61 +377,68 @@ def _translate_direct(package_dir, text):
 
     translator = ctranslate2.Translator(**params)
     try:
+        target_prefix = None
+        prefix = str(metadata.get("target_prefix", "") or "")
+        if prefix:
+            prefix_tokens = tokenizer.encode(prefix, out_type=str)
+            if prefix_tokens:
+                target_prefix = [prefix_tokens] * len(tokenized)
+
         results = translator.translate_batch(
-            [source_tokens],
-            beam_size=beam_size,
-            length_penalty=0.2,
+            tokenized,
+            target_prefix=target_prefix,
             replace_unknowns=True,
-            max_batch_size=1,
+            max_batch_size=batch_size,
+            batch_type="tokens",
+            beam_size=beam_size,
+            num_hypotheses=1,
+            length_penalty=0.2,
             return_scores=False,
         )
-        if not results or not results[0].hypotheses:
-            raise RuntimeError("CTranslate2 returned no hypothesis")
-        target_tokens = results[0].hypotheses[0]
-        return tokenizer.decode(target_tokens)
+        if len(results) != len(tokenized):
+            raise RuntimeError(
+                f"CTranslate2 returned {len(results)} results for {len(tokenized)} inputs"
+            )
+
+        output = []
+        for result in results:
+            if not result.hypotheses:
+                raise RuntimeError("CTranslate2 returned no hypothesis")
+            value = tokenizer.decode(result.hypotheses[0]).strip()
+            if prefix and value.startswith(prefix):
+                value = value[len(prefix):].lstrip()
+            output.append(value)
+        return output
     finally:
         del translator
         del tokenizer
+
 
 def main():
     payload = json.loads(sys.stdin.read())
     source_lang = payload["source"]
     target_lang = payload["target"]
-    text = payload["text"]
+    texts = payload.get("texts")
+    if texts is None:
+        # Backward-compatible single-text payload.
+        texts = [payload.get("text", "")]
+    if not isinstance(texts, list):
+        raise ValueError("texts must be a list")
+    texts = [str(x) for x in texts]
 
     try:
-        package_dir = _find_package(source_lang, target_lang)
+        package_dir, metadata = _find_package(source_lang, target_lang)
         if package_dir is None:
             raise RuntimeError(
-                f"Installed Argos model package not found: "
-                f"{source_lang}->{target_lang}"
+                f"Installed Argos model package not found: {source_lang}->{target_lang}"
             )
-
-        use_korean_native = (
-            os.getenv("ARGOS_KO_ENGINE", "argos-native").lower() == "argos-native"
-            and (source_lang == "ko" or target_lang == "ko")
-        )
-        runner_name = "ct2-direct-from-argos-model"
-        if use_korean_native:
-            try:
-                result = _translate_korean_native(source_lang, target_lang, text)
-                runner_name = "argos-native-korean"
-            except Exception:
-                # Preserve availability: if native Argos cannot load the
-                # package pipeline, fall back to the existing direct CTranslate2
-                # path without changing the rest of the bot.
-                traceback.print_exc(file=sys.stderr)
-                result = _translate_direct(package_dir, text)
-                runner_name = "ct2-direct-korean-fallback"
-        else:
-            result = _translate_direct(package_dir, text)
-
+        result = _translate_direct(package_dir, metadata, texts)
         print(
             json.dumps(
                 {
                     "ok": True,
-                    "result": str(result),
-                    "runner": runner_name,
+                    "results": result,
+                    "runner": "ct2-direct-argos-compatible-v1.0.15",
                     "source": source_lang,
                     "target": target_lang,
                 },
@@ -459,13 +447,9 @@ def main():
         )
     except Exception as exc:
         traceback.print_exc(file=sys.stderr)
-        print(
-            json.dumps(
-                {"ok": False, "error": repr(exc)},
-                ensure_ascii=False,
-            )
-        )
+        print(json.dumps({"ok": False, "error": repr(exc)}, ensure_ascii=False))
         raise
+
 
 if __name__ == "__main__":
     main()
@@ -473,11 +457,12 @@ if __name__ == "__main__":
 
 
 class ArgosWorkerClient:
-    """Compatibility wrapper around an isolated one-shot CTranslate2 subprocess using an Argos model artifact.
+    """One-shot CTranslate2 subprocess per target route.
 
-    The previous v1.0.7 long-lived worker kept the Python/Argos runtime resident
-    under the same Render cgroup. v1.0.9 exits the subprocess after every target,
-    so its CTranslate2 memory is returned to the OS before the next target.
+    A route can contain multiple translatable spans, but they are sent in a
+    single subprocess invocation so the model is loaded once per target. This
+    reduces latency while preserving the memory behavior that motivated the
+    isolated runner.
     """
 
     def __init__(self) -> None:
@@ -498,26 +483,24 @@ class ArgosWorkerClient:
         if not self.started:
             raise RuntimeError("Argos isolated runner is not started")
 
-    def translate(self, text: str, source_lang: str, target_lang: str) -> str:
+    def translate_many(self, texts: list[str], source_lang: str, target_lang: str) -> list[str]:
         self.ensure_alive()
+        if not texts:
+            return []
 
         payload = json.dumps(
-            {
-                "text": text,
-                "source": source_lang,
-                "target": target_lang,
-            },
+            {"texts": texts, "source": source_lang, "target": target_lang},
             ensure_ascii=False,
         )
-
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
 
         log.info(
-            "Argos target start | %s->%s | chars=%d | batch=%s | compute=%s",
+            "Argos target start | %s->%s | fragments=%d | chars=%d | batch=%s | compute=%s",
             source_lang,
             target_lang,
-            len(text),
+            len(texts),
+            sum(len(x) for x in texts),
             env.get("ARGOS_BATCH_SIZE", "1"),
             env.get("ARGOS_COMPUTE_TYPE", "int8"),
         )
@@ -534,20 +517,16 @@ class ArgosWorkerClient:
             )
         except subprocess.TimeoutExpired as exc:
             raise TimeoutError(
-                f"Argos target timed out after "
-                f"{TRANSLATION_TIMEOUT_SECONDS}s ({source_lang}->{target_lang})"
+                f"Argos target timed out after {TRANSLATION_TIMEOUT_SECONDS}s "
+                f"({source_lang}->{target_lang})"
             ) from exc
 
         stderr = (completed.stderr or "").strip()
         stdout = (completed.stdout or "").strip()
-
         if stderr:
-            # Keep the useful Argos log context without allowing an enormous
-            # stderr buffer to flood the Render log.
             for line in stderr.splitlines()[-40:]:
                 logging.getLogger("JAVIS.argos-worker").info(line)
 
-        # The worker emits exactly one JSON result line on stdout.
         response = None
         for line in reversed(stdout.splitlines()):
             line = line.strip()
@@ -562,33 +541,37 @@ class ArgosWorkerClient:
                 break
 
         if completed.returncode != 0:
-            error_detail = (
-                response.get("error")
-                if isinstance(response, dict)
-                else None
-            )
+            error_detail = response.get("error") if isinstance(response, dict) else None
             if not error_detail:
                 error_detail = stderr[-4000:] or "unknown Argos subprocess error"
             raise RuntimeError(
-                f"Argos subprocess failed ({source_lang}->{target_lang}): "
-                f"{error_detail}"
+                f"Argos subprocess failed ({source_lang}->{target_lang}): {error_detail}"
             )
 
         if not isinstance(response, dict) or not response.get("ok"):
             raise RuntimeError(
-                f"Argos subprocess returned no successful result "
-                f"({source_lang}->{target_lang})"
+                f"Argos subprocess returned no successful result ({source_lang}->{target_lang})"
             )
 
-        result = str(response.get("result", ""))
+        results = response.get("results")
+        if not isinstance(results, list) or len(results) != len(texts):
+            raise RuntimeError(
+                f"Argos subprocess returned {len(results) if isinstance(results, list) else 0} "
+                f"results for {len(texts)} fragments ({source_lang}->{target_lang})"
+            )
+
+        results = [str(x) for x in results]
         log.info(
             "Argos target complete | %s->%s | result_chars=%d | subprocess_exit=%s",
             source_lang,
             target_lang,
-            len(result),
+            sum(len(x) for x in results),
             completed.returncode,
         )
-        return result
+        return results
+
+    def translate(self, text: str, source_lang: str, target_lang: str) -> str:
+        return self.translate_many([text], source_lang, target_lang)[0]
 
     def shutdown(self) -> None:
         self.started = False
@@ -597,36 +580,49 @@ class ArgosWorkerClient:
 ARGOS_WORKER: ArgosWorkerClient | None = None
 
 
+def _preserve_whitespace(fragment: str) -> tuple[str, str, str]:
+    left = fragment[: len(fragment) - len(fragment.lstrip())]
+    right = fragment[len(fragment.rstrip()):]
+    core = fragment.strip()
+    return left, core, right
+
+
 def translate_sync(text: str, source_lang: str, target_lang: str) -> str:
     if ARGOS_WORKER is None:
         raise RuntimeError("Argos isolated runner is not started")
 
-    # v1.0.13: translate only language spans. URLs, custom Discord emoji,
-    # mentions, and Unicode emoji never enter the translation model. This
-    # prevents placeholder corruption such as "JAVISX1QZ" or "JAV 0 0 0".
     spans = split_non_translatable_spans(text)
     output: list[str] = []
-    translated_span_count = 0
+    jobs: list[tuple[int, Protector, str, str, str]] = []
 
-    for is_protected, fragment in spans:
+    for idx, (is_protected, fragment) in enumerate(spans):
         if is_protected or not fragment:
             output.append(fragment)
             continue
-
-        if not fragment.strip():
+        left, core, right = _preserve_whitespace(fragment)
+        if not core:
             output.append(fragment)
             continue
+        prepared, protector = prepare_for_translation(core, source_lang)
+        output.append(None)  # type: ignore[arg-type]
+        jobs.append((idx, protector, left, right, prepared))
 
-        prepared, protector = prepare_for_translation(fragment, source_lang)
-        result = ARGOS_WORKER.translate(prepared, source_lang, target_lang)
-        result = restore_twom_terms(result, protector, target_lang)
-        output.append(result)
-        translated_span_count += 1
+    if jobs:
+        results = ARGOS_WORKER.translate_many(
+            [job[4] for job in jobs], source_lang, target_lang
+        )
+        for job, result in zip(jobs, results):
+            idx, protector, left, right, _prepared = job
+            restored = restore_twom_terms(result, protector, target_lang)
+            output[idx] = left + restored + right
 
     combined = "".join(output)
     log.info(
-        "Preserved non-translatable spans | source=%s | target=%s | spans=%d",
-        source_lang, target_lang, translated_span_count,
+        "Preserved non-translatable spans | source=%s | target=%s | protected_spans=%d | translated_spans=%d",
+        source_lang,
+        target_lang,
+        sum(1 for protected, _ in spans if protected),
+        len(jobs),
     )
     return combined
 
@@ -639,28 +635,37 @@ def translate_all_sync(original: str) -> dict[str, str]:
         return {"source": source_lang, "en": "", "th": "", "ko": "", "errors": {}}
 
     log.info("Translating message | source=%s | chars=%d", source_lang, len(clean))
-
     targets: dict[str, str] = {}
     errors: dict[str, str] = {}
 
-    def run_target(label: str, source: str, target: str) -> None:
+    def run_target(label: str, source: str, target: str, text: str) -> str | None:
         try:
-            targets[label] = translate_sync(clean, source, target)
+            value = translate_sync(text, source, target)
+            if not value.strip():
+                raise RuntimeError(f"Empty translation result: {source}->{target}")
+            targets[label] = value
+            return value
         except Exception as exc:
             errors[f"{source}->{target}"] = str(exc)
             log.exception("Target translation failed | %s->%s", source, target)
+            return None
 
     if source_lang == "en":
-        run_target("th", "en", "th")
-        run_target("ko", "en", "ko")
+        run_target("th", "en", "th", clean)
+        run_target("ko", "en", "ko", clean)
     elif source_lang == "th":
-        run_target("en", "th", "en")
-        # Important: always feed the original clean text to EN->KO.
-        # This preserves the user's requested English pivot behavior.
-        run_target("ko", "en", "ko")
+        # Correct pivot behavior: Thai -> English first, then English -> Korean
+        # using the English result. v1.0.14 incorrectly sent raw Thai text into
+        # the English->Korean model, which explains poor/empty Korean output.
+        english = run_target("en", "th", "en", clean)
+        if english:
+            run_target("ko", "en", "ko", english)
     else:
-        run_target("en", "ko", "en")
-        run_target("th", "en", "th")
+        # Correct pivot behavior: Korean -> English first, then English -> Thai
+        # using the English result.
+        english = run_target("en", "ko", "en", clean)
+        if english:
+            run_target("th", "en", "th", english)
 
     return {"source": source_lang, **targets, "errors": errors}
 
@@ -717,7 +722,9 @@ async def health(request: web.Request) -> web.Response:
             "korean_engine": os.getenv("ARGOS_KO_ENGINE", "argos-native"),
             "korean_beam_size": int(os.getenv("ARGOS_KO_BEAM_SIZE", "4")),
             "translation_worker_alive": worker_alive,
-            "translation_runner_mode": "ct2-direct-from-argos-model-per-target",
+            "translation_runner_mode": "ct2-direct-argos-compatible-v1.0.15-per-target",
+            "quality_mode": "argos-compatible-decoding+pivot-fix",
+            "pivot_mode": "th->en->ko and ko->en->th",
             "non_translatable_mode": "segment-preserve",
             "argos_packages_dir": os.getenv("ARGOS_PACKAGES_DIR", ""),
             "discord_token_configured": token_configured,
