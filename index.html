@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>JAVIS — TWOM Translator v1.0.21</title>
+  <title>JAVIS — TWOM Translator v1.0.22</title>
   <style>
     :root { color-scheme: dark; }
     body { margin:0; font-family:system-ui,-apple-system,Segoe UI,sans-serif; background:#0f1115; color:#f3f4f6; }
@@ -28,7 +28,7 @@
   <h1>JAVIS — TWOM Auto Translator</h1>
   <p id="message">กำลังตรวจสอบสถานะบริการ...</p>
   <div class="grid">
-    <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.21</div></div>
+    <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.22</div></div>
     <div class="item"><div class="label">Languages</div><div class="value">TH → EN + KO<br>EN → TH + KO<br>KO → EN + TH</div></div>
     <div class="item"><div class="label">Engine</div><div class="value">Argos + CTranslate2</div></div>
     <div class="item"><div class="label">Runtime Quantization</div><div id="compute" class="value">Checking...</div></div>
@@ -42,6 +42,8 @@
     <div class="item"><div class="label">Login Retries</div><div id="loginretries" class="value">Checking...</div></div>
     <div class="item"><div class="label">Session Recovery</div><div id="sessionrecovery" class="value">Checking...</div></div>
     <div class="item"><div class="label">Retry After</div><div id="retryafter" class="value">Checking...</div></div>
+    <div class="item"><div class="label">Outbound REST Cooldown</div><div id="outboundcooldown" class="value">Checking...</div></div>
+    <div class="item"><div class="label">Last Outbound 429</div><div id="outboundcontext" class="value">Checking...</div></div>
     <div class="item"><div class="label">Startup Handover</div><div id="handover" class="value">Checking...</div></div>
     <div class="item"><div class="label">Last 429 Scope</div><div id="lastscope" class="value">Checking...</div></div>
     <div class="item"><div class="label">Last 429 Global</div><div id="lastglobal" class="value">Checking...</div></div>
@@ -88,6 +90,8 @@ async function refreshStatus() {
     document.getElementById('loginretries').textContent=`${d.discord_login_retry_count ?? 0}`;
     document.getElementById('sessionrecovery').textContent=`${d.discord_login_session_recovery_count ?? 0}`;
     document.getElementById('retryafter').textContent=`${Number(d.discord_login_retry_after || 0).toFixed(1)}s`;
+    document.getElementById('outboundcooldown').textContent=`${Number(d.discord_outbound_block_retry_after || 0).toFixed(1)}s`;
+    document.getElementById('outboundcontext').textContent=d.discord_outbound_last_429_context || 'none';
     document.getElementById('handover').textContent=`${Number(d.discord_startup_handover_delay_seconds || 0).toFixed(0)}s first-login hold`;
     document.getElementById('lastscope').textContent=d.discord_login_last_scope || 'unknown';
     document.getElementById('lastglobal').textContent=d.discord_login_last_global ? 'true' : 'false';
@@ -104,6 +108,9 @@ async function refreshStatus() {
         } else {
           message.textContent = `Discord API จำกัดอัตราชั่วคราว — JAVIS จะรอตาม Retry-After แล้วเชื่อมต่อใหม่เอง (เหลือประมาณ ${wait.toFixed(1)} วินาที)`;
         }
+      } else if(Number(d.discord_outbound_block_retry_after || 0) > 0){
+        const wait = Number(d.discord_outbound_block_retry_after || 0);
+        message.textContent = `JAVIS งดส่ง Discord HTTP ชั่วคราวเพื่อไม่สร้าง 429 เพิ่มเติม (เหลือประมาณ ${wait.toFixed(1)} วินาที)`;
       } else {
         message.textContent='ตรวจสอบสถานะ Discord token, Discord Gateway และ Translation worker ที่ /health';
       }

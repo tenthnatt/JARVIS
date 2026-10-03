@@ -17,7 +17,7 @@ from discord.ext import commands
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.21")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.22")
 
 PORT = int(os.getenv("PORT", "10000"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "1200"))
@@ -702,6 +702,8 @@ DISCORD_LOGIN_SESSION_RECOVERY_COUNT = 0
 
 # Render zero-downtime deploys start a new instance before SIGTERM-ing the old one.
 # Delay only the FIRST Discord login attempt so the old Gateway has time to hand over.
+# This does not probe Discord during an existing restriction; the 429 Retry-After
+# value remains the authoritative retry timer.
 DISCORD_STARTUP_HANDOVER_DELAY_SECONDS = max(
     0.0,
     float(os.getenv("DISCORD_STARTUP_HANDOVER_DELAY", "75")),
@@ -716,6 +718,13 @@ DISCORD_LOGIN_LAST_CF_RAY = ""
 DISCORD_LOGIN_LAST_VIA = ""
 DISCORD_LOGIN_LAST_SERVER = ""
 DISCORD_LOGIN_LAST_MESSAGE = ""
+
+# Central outbound Discord HTTP cooldown. Any message/edit HTTP 429 arms this
+# process-local gate until Retry-After so fallback requests do not create more 429s.
+DISCORD_OUTBOUND_BLOCKED_UNTIL_MONO = 0.0
+DISCORD_OUTBOUND_LAST_429_RETRY_AFTER = 0.0
+DISCORD_OUTBOUND_LAST_429_CONTEXT = ""
+DISCORD_OUTBOUND_LAST_CF_RAY = ""
 
 
 def _preserve_whitespace(fragment: str) -> tuple[str, str, str]:
@@ -896,6 +905,10 @@ async def health(request: web.Request) -> web.Response:
             "discord_login_last_via": DISCORD_LOGIN_LAST_VIA,
             "discord_login_last_server": DISCORD_LOGIN_LAST_SERVER,
             "discord_login_last_message": DISCORD_LOGIN_LAST_MESSAGE,
+            "discord_outbound_block_retry_after": max(0.0, DISCORD_OUTBOUND_BLOCKED_UNTIL_MONO - time.monotonic()),
+            "discord_outbound_last_429_retry_after": DISCORD_OUTBOUND_LAST_429_RETRY_AFTER,
+            "discord_outbound_last_429_context": DISCORD_OUTBOUND_LAST_429_CONTEXT,
+            "discord_outbound_last_429_cf_ray": DISCORD_OUTBOUND_LAST_CF_RAY,
         },
         status=200 if token_configured and worker_alive else 503,
     )
@@ -947,7 +960,7 @@ async def on_ready():
 @bot.command(name="status")
 async def status_command(ctx: commands.Context):
     worker_alive = ARGOS_WORKER is not None and ARGOS_WORKER.started
-    await ctx.reply(
+    await safe_context_reply(ctx,
         "JAVIS พร้อมใช้งาน ✅\n"
         f"Version: v{JAVIS_VERSION}\n"
         "Engine: Argos Translate + CTranslate2\n"
@@ -965,7 +978,7 @@ async def status_command(ctx: commands.Context):
 
 @bot.command(name="help")
 async def help_command(ctx: commands.Context):
-    await ctx.reply(
+    await safe_context_reply(ctx,
         "JAVIS Help 📘\n"
         "• ส่งข้อความปกติ: TH→EN+KO / EN→TH+KO / KO→EN+TH\n"
         "• !javis status: ดูสถานะและ Version ของบอท\n"
@@ -984,13 +997,13 @@ async def reload_command(ctx: commands.Context):
         TWOM_DICTIONARY = load_dictionary()
     except Exception as exc:
         log.exception("Dictionary reload failed")
-        await ctx.reply(
+        await safe_context_reply(ctx,
             f"โหลด TWOM Dictionary ไม่สำเร็จ: `{exc}`",
             mention_author=False,
             allowed_mentions=ALLOWED_MENTIONS,
         )
         return
-    await ctx.reply(
+    await safe_context_reply(ctx,
         f"โหลด TWOM Dictionary ใหม่แล้ว ✅ ({len(TWOM_DICTIONARY)} entries)",
         mention_author=False,
         allowed_mentions=ALLOWED_MENTIONS,
@@ -1002,7 +1015,7 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.CommandNotFound):
         return
     if isinstance(error, commands.MissingPermissions):
-        await ctx.reply(
+        await safe_context_reply(ctx,
             "คำสั่งนี้ต้องมีสิทธิ์ Manage Server",
             mention_author=False,
             allowed_mentions=ALLOWED_MENTIONS,
@@ -1011,37 +1024,142 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     log.exception("Discord command error", exc_info=error)
 
 
-async def send_safe_translation(
-    message: discord.Message,
-    content: str,
-) -> discord.Message:
-    # Use channel.send as the primary path. It is the simplest Discord API
-    # operation for this text-only bot and avoids reply-reference edge cases.
-    # Keep reply() as a fallback so existing channel behavior still works.
+def _discord_outbound_block_remaining() -> float:
+    return max(0.0, DISCORD_OUTBOUND_BLOCKED_UNTIL_MONO - time.monotonic())
+
+
+def _record_discord_outbound_429(exc: Exception, *, context: str) -> float:
+    """Arm the outbound cooldown using Discord's Retry-After metadata."""
+    global DISCORD_OUTBOUND_BLOCKED_UNTIL_MONO
+    global DISCORD_OUTBOUND_LAST_429_RETRY_AFTER, DISCORD_OUTBOUND_LAST_429_CONTEXT
+    global DISCORD_OUTBOUND_LAST_CF_RAY
+
+    retry_after = 0.0
+    try:
+        retry_after = float(getattr(exc, "retry_after", 0) or 0)
+    except (TypeError, ValueError):
+        retry_after = 0.0
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    if retry_after <= 0:
+        for key in ("Retry-After", "retry-after", "X-RateLimit-Reset-After", "x-ratelimit-reset-after"):
+            raw = headers.get(key) if hasattr(headers, "get") else None
+            if raw is None:
+                continue
+            try:
+                retry_after = max(0.0, float(raw))
+                break
+            except (TypeError, ValueError):
+                pass
+    retry_after = max(1.0, retry_after)
+
+    try:
+        cf_ray = str(headers.get("CF-Ray") or headers.get("cf-ray") or "")
+    except Exception:
+        cf_ray = ""
+
+    DISCORD_OUTBOUND_BLOCKED_UNTIL_MONO = max(
+        DISCORD_OUTBOUND_BLOCKED_UNTIL_MONO,
+        time.monotonic() + retry_after,
+    )
+    DISCORD_OUTBOUND_LAST_429_RETRY_AFTER = retry_after
+    DISCORD_OUTBOUND_LAST_429_CONTEXT = context
+    DISCORD_OUTBOUND_LAST_CF_RAY = cf_ray
+    log.warning(
+        "Discord outbound REST cooldown armed | context=%s | retry_after=%.3fs | cf_ray=%s | no fallback HTTP will be sent",
+        context,
+        retry_after,
+        cf_ray or "-",
+    )
+    return retry_after
+
+
+async def send_safe_translation(message: discord.Message, content: str) -> discord.Message | None:
+    """Single-attempt translation send; never retry a failed Discord HTTP call."""
+    remaining = _discord_outbound_block_remaining()
+    if remaining > 0:
+        log.warning(
+            "Discord translation send skipped during outbound cooldown | remaining=%.1fs | no HTTP sent",
+            remaining,
+        )
+        return None
     try:
         log.info("Discord send start | channel=%s | chars=%d", getattr(message.channel, "id", "?"), len(content))
         sent = await asyncio.wait_for(
-            message.channel.send(
-                content,
-                allowed_mentions=ALLOWED_MENTIONS,
-            ),
+            message.channel.send(content, allowed_mentions=ALLOWED_MENTIONS),
             timeout=20,
         )
         log.info("Discord send complete | channel=%s | chars=%d", getattr(message.channel, "id", "?"), len(content))
         return sent
-    except (asyncio.TimeoutError, discord.Forbidden, discord.HTTPException):
-        log.exception("Discord channel.send failed; falling back to message.reply")
+    except asyncio.TimeoutError:
+        log.warning("Discord translation send timed out safely; no fallback HTTP request will be sent")
+    except discord.HTTPException as exc:
+        if getattr(exc, "status", None) == 429:
+            _record_discord_outbound_429(exc, context="translation:channel-send")
+        else:
+            log.warning(
+                "Discord translation send HTTP failed | status=%s | no fallback HTTP request will be sent",
+                getattr(exc, "status", None),
+            )
+    except Exception as exc:
+        log.warning("Discord translation send failed safely | %r | no fallback HTTP request will be sent", exc)
+    return None
 
-    sent = await asyncio.wait_for(
-        message.reply(
-            content,
-            mention_author=False,
-            allowed_mentions=ALLOWED_MENTIONS,
-        ),
-        timeout=20,
-    )
-    log.info("Discord reply fallback complete | channel=%s | chars=%d", getattr(message.channel, "id", "?"), len(content))
-    return sent
+
+async def edit_safe_translation(sent_message: discord.Message, content: str) -> bool:
+    """Single-attempt progressive edit; a failed HTTP call is never retried."""
+    remaining = _discord_outbound_block_remaining()
+    if remaining > 0:
+        log.warning(
+            "Discord translation edit skipped during outbound cooldown | remaining=%.1fs | no HTTP sent",
+            remaining,
+        )
+        return False
+    try:
+        await asyncio.wait_for(
+            sent_message.edit(content=content, allowed_mentions=ALLOWED_MENTIONS),
+            timeout=20,
+        )
+        return True
+    except asyncio.TimeoutError:
+        log.warning("Discord translation edit timed out safely; no fallback HTTP request will be sent")
+    except discord.HTTPException as exc:
+        if getattr(exc, "status", None) == 429:
+            _record_discord_outbound_429(exc, context="translation:message-edit")
+        else:
+            log.warning(
+                "Discord translation edit HTTP failed | status=%s | no fallback HTTP request will be sent",
+                getattr(exc, "status", None),
+            )
+    except Exception as exc:
+        log.warning("Discord translation edit failed safely | %r | no fallback HTTP request will be sent", exc)
+    return False
+
+
+async def safe_context_reply(ctx: commands.Context, content: str, **kwargs) -> bool:
+    """Command reply helper that never retries during a Discord 429 cooldown."""
+    if _discord_outbound_block_remaining() > 0:
+        log.warning("Discord command reply skipped during outbound cooldown | no HTTP sent")
+        return False
+    try:
+        await asyncio.wait_for(
+            ctx.reply(
+                content,
+                **kwargs,
+            ),
+            timeout=20,
+        )
+        return True
+    except asyncio.TimeoutError:
+        log.warning("Discord command reply timed out safely; no retry HTTP request will be sent")
+    except discord.HTTPException as exc:
+        if getattr(exc, "status", None) == 429:
+            _record_discord_outbound_429(exc, context="command:reply")
+        else:
+            log.warning("Discord command reply HTTP failed | status=%s | no retry HTTP request will be sent", getattr(exc, "status", None))
+    except Exception as exc:
+        log.warning("Discord command reply failed safely | %r | no retry HTTP request will be sent", exc)
+    return False
 
 
 @bot.event
@@ -1128,15 +1246,14 @@ async def on_message(message: discord.Message):
                         getattr(message.channel, "id", "?"),
                         len(response),
                     )
-                    await asyncio.wait_for(
-                        sent_message.edit(content=response, allowed_mentions=ALLOWED_MENTIONS),
-                        timeout=20,
-                    )
-                    log.info(
-                        "Discord edit complete | channel=%s | chars=%d",
-                        getattr(message.channel, "id", "?"),
-                        len(response),
-                    )
+                    if await edit_safe_translation(sent_message, response):
+                        log.info(
+                            "Discord edit complete | channel=%s | chars=%d",
+                            getattr(message.channel, "id", "?"),
+                            len(response),
+                        )
+                    else:
+                        return
                 return
 
             # Fallback for unusually large output or when no first target
@@ -1160,18 +1277,21 @@ async def on_message(message: discord.Message):
                 chunks.append(current)
 
             if sent_message is not None:
-                await asyncio.wait_for(
-                    sent_message.edit(content=chunks[0], allowed_mentions=ALLOWED_MENTIONS),
-                    timeout=20,
-                )
+                if not await edit_safe_translation(sent_message, chunks[0]):
+                    return
                 for chunk in chunks[1:]:
-                    await message.channel.send(chunk, allowed_mentions=ALLOWED_MENTIONS)
+                    if await send_safe_translation(message, chunk) is None:
+                        break
             else:
                 await send_safe_translation(message, chunks[0])
                 for chunk in chunks[1:]:
-                    await message.channel.send(chunk, allowed_mentions=ALLOWED_MENTIONS)
+                    if await send_safe_translation(message, chunk) is None:
+                        break
     except Exception as exc:
         log.exception("Translation failed")
+        if _discord_outbound_block_remaining() > 0:
+            log.warning("Translation error response suppressed during Discord outbound cooldown | no HTTP sent")
+            return
         await send_safe_translation(
             message,
             "JAVIS แปลข้อความนี้ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง",
@@ -1391,10 +1511,15 @@ async def _start_discord_with_rate_limit_retry(discord_token: str) -> None:
                     diag.get("text") or "-",
                 )
 
-                # Do NOT close bot.http here. Discord explicitly tells clients
-                # to wait for Retry-After/retry_after before making another
-                # request; the existing aiohttp session can remain open.
-                await _reset_discord_client_state_after_login_error("http-429")
+                # Respect Retry-After and dispose of the failed login HTTP session.
+                # Closing alone is unsafe because a later static_login() could reuse
+                # a closed aiohttp session. close + Client.clear() gives discord.py
+                # a clean HTTP session for the next allowed login attempt.
+                try:
+                    await bot.http.close()
+                except Exception:
+                    log.exception("Failed to close Discord HTTP session after login 429")
+                await _reset_discord_client_state_after_login_error("http-429-session-reset")
                 try:
                     await asyncio.wait_for(DISCORD_SHUTDOWN_EVENT.wait(), timeout=wait_seconds)
                     DISCORD_LOGIN_STATE = "shutdown_requested"
@@ -1417,6 +1542,10 @@ async def _start_discord_with_rate_limit_retry(discord_token: str) -> None:
                     DISCORD_LOGIN_SESSION_RECOVERY_COUNT,
                     wait_seconds,
                 )
+                try:
+                    await bot.http.close()
+                except Exception:
+                    pass
                 await _reset_discord_client_state_after_login_error("closed-session")
                 try:
                     await asyncio.wait_for(DISCORD_SHUTDOWN_EVENT.wait(), timeout=wait_seconds)
