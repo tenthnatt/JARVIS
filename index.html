@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>JAVIS — TWOM Translator v1.0.24</title>
+  <title>JAVIS — TWOM Translator v1.0.25</title>
   <style>
     :root { color-scheme: dark; }
     body { margin:0; font-family:system-ui,-apple-system,Segoe UI,sans-serif; background:#0f1115; color:#f3f4f6; }
@@ -28,7 +28,7 @@
   <h1>JAVIS — TWOM Auto Translator</h1>
   <p id="message">กำลังตรวจสอบสถานะบริการ...</p>
   <div class="grid">
-    <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.24</div></div>
+    <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.25</div></div>
     <div class="item"><div class="label">Languages</div><div class="value">TH → EN + KO<br>EN → TH + KO<br>KO → EN + TH</div></div>
     <div class="item"><div class="label">Engine</div><div class="value">Argos + CTranslate2</div></div>
     <div class="item"><div class="label">Runtime Quantization</div><div id="compute" class="value">Checking...</div></div>
@@ -38,6 +38,8 @@
     <div class="item"><div class="label">Chunking</div><div id="chunk" class="value">Checking...</div></div>
     <div class="item"><div class="label">Translation Runner</div><div id="worker" class="value">Checking...</div></div>
     <div class="item"><div class="label">Discord Bot</div><div id="discord" class="value">Checking...</div></div>
+    <div class="item"><div class="label">Translation Rooms</div><div id="rooms" class="value">Checking...</div></div>
+    <div class="item"><div class="label">Slash Commands</div><div id="roomcmd" class="value">Checking...</div></div>
     <div class="item"><div class="label">Discord Login</div><div id="loginstate" class="value">Checking...</div></div>
     <div class="item"><div class="label">Login Retries</div><div id="loginretries" class="value">Checking...</div></div>
     <div class="item"><div class="label">Session Recovery</div><div id="sessionrecovery" class="value">Checking...</div></div>
@@ -54,7 +56,7 @@
     <div class="item"><div class="label">Argos Packages</div><div id="packages" class="value small">Checking...</div></div>
   </div>
   <div class="grid" style="margin-top:12px">
-    <div class="item"><div class="label">Commands</div><div class="value">!javis status<br>!javis reload<br>!javis help</div></div>
+    <div class="item"><div class="label">Commands</div><div class="value">/setroom &lt;channel&gt;<br>/delroom &lt;channel&gt;<br>/roomlist<br>!javis status / reload / help</div></div>
     <div class="item"><div class="label">Memory Strategy</div><div class="value">Argos-compatible CTranslate2 decoding<br>One target process at a time · TWOM span glossary</div></div>
     <div class="item"><div class="label">Voice</div><div class="value">Not used · text-only</div></div>
     <div class="item"><div class="label">Non-translatable</div><div class="value">URLs / Discord emoji / Unicode emoji are preserved and never translated; URL/emoji-only messages are ignored</div></div>
@@ -87,6 +89,8 @@ async function refreshStatus() {
     document.getElementById('packages').textContent=d.argos_packages_dir || 'default';
     document.getElementById('token').textContent=d.discord_token_configured ? 'Configured ✅' : 'Missing ❌';
     document.getElementById('discord').textContent=d.discord_ready ? 'Connected ✅' : 'Not connected ❌';
+    if(document.getElementById('rooms')) document.getElementById('rooms').textContent=`${d.translation_room_count ?? 0}`;
+    if(document.getElementById('roomcmd')) document.getElementById('roomcmd').textContent=d.translation_room_command_sync_state || 'pending';
     document.getElementById('loginstate').textContent=d.discord_login_state || 'unknown';
     document.getElementById('loginretries').textContent=`${d.discord_login_retry_count ?? 0}`;
     document.getElementById('sessionrecovery').textContent=`${d.discord_login_session_recovery_count ?? 0}`;
@@ -100,7 +104,7 @@ async function refreshStatus() {
     document.getElementById('lastcfray').textContent=d.discord_login_last_cf_ray || '-';
     if(d.ok && d.translation_worker_alive && d.discord_ready){
       badge.textContent='● JAVIS ONLINE'; badge.className='ok';
-      message.textContent=`Discord + Translation worker are running. Non-translatable content mode: ${d.non_translatable_mode || 'preserved'}.`;
+      message.textContent=`Discord + Translation worker are running. Use /setroom to choose translation rooms, /delroom to remove them, and /roomlist to review them.`;
     } else {
       badge.textContent='● CONFIGURATION / WORKER CHECK'; badge.className='ok warn';
       if(d.discord_login_state === 'rate_limited_waiting' || d.discord_login_state === 'retrying' || d.discord_login_state === 'handover_waiting'){

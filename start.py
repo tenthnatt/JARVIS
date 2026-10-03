@@ -1,4 +1,4 @@
-"""JAVIS Render/Docker entrypoint v1.0.24.
+"""JAVIS Render/Docker entrypoint v1.0.25.
 
 Sets all Argos/CTranslate2 runtime settings BEFORE bot.py imports anything that
 needs those settings. The Discord bot itself remains in bot.py.
@@ -7,7 +7,7 @@ needs those settings. The Discord bot itself remains in bot.py.
 import asyncio
 import os
 
-JAVIS_VERSION = "1.0.24"
+JAVIS_VERSION = "1.0.25"
 os.environ["JAVIS_VERSION"] = JAVIS_VERSION
 
 # Render zero-downtime deploy protection: Render starts a new instance before
@@ -16,6 +16,10 @@ os.environ["JAVIS_VERSION"] = JAVIS_VERSION
 # bot.py treats a pre-existing Discord 429 as a hard no-request window and does not
 # send extra startup probes that could create more invalid requests.
 os.environ.setdefault("DISCORD_STARTUP_HANDOVER_DELAY", "75")
+
+# Optional: set DISCORD_GUILD_ID in Render to publish /setroom, /delroom and
+# /roomlist to one guild immediately. Without it, global sync is used.
+
 
 # Runtime quantization: CTranslate2 models are loaded as INT8 in RAM.
 # Render Environment Variables may override these values, but these defaults

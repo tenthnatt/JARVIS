@@ -13,11 +13,21 @@ from pathlib import Path
 from aiohttp import web
 import discord
 from discord.ext import commands
+from discord import app_commands
 
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.24")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.25")
+
+# Translation-room configuration. JAVIS translates messages ONLY in channels
+# explicitly enabled with /setroom. The configuration is per Discord guild.
+TRANSLATION_ROOMS_PATH = BASE_DIR / "translation_rooms.json"
+TRANSLATION_ROOMS: dict[str, set[int]] = {}
+TRANSLATION_ROOMS_IO_LOCK = asyncio.Lock()
+TRANSLATION_ROOM_COMMAND_SYNC_STARTED = False
+TRANSLATION_ROOM_COMMAND_SYNC_STATE = "pending"
+TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = 0.0
 
 PORT = int(os.getenv("PORT", "10000"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "1200"))
@@ -77,6 +87,67 @@ class SuppressUnusedVoiceDependencyWarning(logging.Filter):
 
 logging.getLogger("discord.client").addFilter(SuppressUnusedVoiceDependencyWarning())
 log = logging.getLogger("JAVIS")
+
+
+def _load_translation_rooms_sync() -> None:
+    """Load per-guild translation-room IDs from local JSON config."""
+    TRANSLATION_ROOMS.clear()
+    try:
+        if not TRANSLATION_ROOMS_PATH.exists():
+            return
+        raw = json.loads(TRANSLATION_ROOMS_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("translation_rooms.json must contain an object")
+        for guild_id, channel_ids in raw.items():
+            if not isinstance(channel_ids, list):
+                continue
+            cleaned: set[int] = set()
+            for channel_id in channel_ids:
+                try:
+                    parsed = int(channel_id)
+                except (TypeError, ValueError):
+                    continue
+                if parsed > 0:
+                    cleaned.add(parsed)
+            if cleaned:
+                TRANSLATION_ROOMS[str(guild_id)] = cleaned
+        log.info(
+            "Translation room config loaded | guilds=%d | rooms=%d",
+            len(TRANSLATION_ROOMS),
+            sum(len(v) for v in TRANSLATION_ROOMS.values()),
+        )
+    except Exception as exc:
+        log.warning("Translation room config load failed safely | %r", exc)
+
+
+def _save_translation_rooms_sync() -> None:
+    """Atomically save the per-guild translation-room IDs."""
+    payload = {
+        str(guild_id): sorted(int(channel_id) for channel_id in channel_ids)
+        for guild_id, channel_ids in TRANSLATION_ROOMS.items()
+        if channel_ids
+    }
+    temp_path = TRANSLATION_ROOMS_PATH.with_suffix(".json.tmp")
+    temp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    temp_path.replace(TRANSLATION_ROOMS_PATH)
+
+
+def _translation_room_ids(guild_id: int) -> set[int]:
+    return set(TRANSLATION_ROOMS.get(str(int(guild_id)), set()))
+
+
+def _is_translation_room_enabled(guild_id: int, channel_id: int) -> bool:
+    return int(channel_id) in TRANSLATION_ROOMS.get(str(int(guild_id)), set())
+
+
+def _translation_room_count() -> int:
+    return sum(len(channel_ids) for channel_ids in TRANSLATION_ROOMS.values())
+
+
+_load_translation_rooms_sync()
 
 SUPPORTED = {"en", "th", "ko"}
 LANG_NAMES = {"en": "EN", "th": "TH", "ko": "KO"}
@@ -958,6 +1029,7 @@ async def on_ready():
         JAVIS_VERSION,
     )
     await bot.change_presence(activity=discord.Game(name="TH ↔ EN ↔ KO | TWOM"))
+    _ensure_translation_room_command_sync_task()
 
 
 @bot.command(name="status")
@@ -1010,6 +1082,276 @@ async def reload_command(ctx: commands.Context):
         f"โหลด TWOM Dictionary ใหม่แล้ว ✅ ({len(TWOM_DICTIONARY)} entries)",
         mention_author=False,
         allowed_mentions=ALLOWED_MENTIONS,
+    )
+
+
+async def _sync_translation_room_commands_once() -> None:
+    """Register room-management slash commands once, respecting Discord 429s."""
+    global TRANSLATION_ROOM_COMMAND_SYNC_STATE, TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER
+    configured_guild_id = os.getenv("DISCORD_GUILD_ID", "").strip()
+
+    async def _do_sync() -> int:
+        if configured_guild_id.isdigit() and int(configured_guild_id) > 0:
+            guild = discord.Object(id=int(configured_guild_id))
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            TRANSLATION_ROOM_COMMAND_SYNC_STATE = "synced_guild"
+        else:
+            synced = await bot.tree.sync()
+            TRANSLATION_ROOM_COMMAND_SYNC_STATE = "synced_global"
+        TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = 0.0
+        return len(synced)
+
+    try:
+        count = await _do_sync()
+        log.info(
+            "Translation room slash commands synced | commands=%d | scope=%s",
+            count,
+            "guild" if configured_guild_id.isdigit() and int(configured_guild_id) > 0 else "global",
+        )
+        return
+    except discord.HTTPException as exc:
+        if getattr(exc, "status", None) != 429:
+            TRANSLATION_ROOM_COMMAND_SYNC_STATE = "sync_failed"
+            log.warning(
+                "Translation room slash-command sync failed safely | status=%s | %r",
+                getattr(exc, "status", None),
+                exc,
+            )
+            return
+
+        retry_after, _ = _discord_retry_after_seconds(exc, 60.0)
+        TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = retry_after
+        TRANSLATION_ROOM_COMMAND_SYNC_STATE = "rate_limited_waiting"
+        log.warning(
+            "Translation room slash-command sync rate-limited | retry_after=%.1fs | no immediate retry",
+            retry_after,
+        )
+        try:
+            _record_discord_outbound_429(exc, context="startup:translation-room-command-sync")
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(DISCORD_SHUTDOWN_EVENT.wait(), timeout=retry_after)
+            TRANSLATION_ROOM_COMMAND_SYNC_STATE = "shutdown_requested"
+            TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = 0.0
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        if DISCORD_SHUTDOWN_EVENT.is_set():
+            TRANSLATION_ROOM_COMMAND_SYNC_STATE = "shutdown_requested"
+            TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = 0.0
+            return
+
+        try:
+            count = await _do_sync()
+            TRANSLATION_ROOM_COMMAND_SYNC_STATE = "synced_after_retry"
+            TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = 0.0
+            log.info("Translation room slash commands synced after one delayed retry | commands=%d", count)
+        except discord.HTTPException as retry_exc:
+            if getattr(retry_exc, "status", None) == 429:
+                try:
+                    _record_discord_outbound_429(
+                        retry_exc,
+                        context="startup:translation-room-command-sync-retry",
+                    )
+                except Exception:
+                    pass
+            TRANSLATION_ROOM_COMMAND_SYNC_STATE = "sync_failed"
+            TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = 0.0
+            log.warning(
+                "Translation room slash-command sync retry failed safely | status=%s",
+                getattr(retry_exc, "status", None),
+            )
+        except Exception as retry_exc:
+            TRANSLATION_ROOM_COMMAND_SYNC_STATE = "sync_failed"
+            TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = 0.0
+            log.warning("Translation room slash-command sync retry failed safely | %r", retry_exc)
+    except Exception as exc:
+        TRANSLATION_ROOM_COMMAND_SYNC_STATE = "sync_failed"
+        TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = 0.0
+        log.warning("Translation room slash-command sync failed safely | %r", exc)
+
+
+def _ensure_translation_room_command_sync_task() -> None:
+    global TRANSLATION_ROOM_COMMAND_SYNC_STARTED
+    if TRANSLATION_ROOM_COMMAND_SYNC_STARTED:
+        return
+    TRANSLATION_ROOM_COMMAND_SYNC_STARTED = True
+    asyncio.create_task(
+        _sync_translation_room_commands_once(),
+        name="javis-translation-room-command-sync",
+    )
+
+
+async def _safe_interaction_message(
+    interaction: discord.Interaction,
+    content: str,
+    *,
+    ephemeral: bool = True,
+) -> bool:
+    """Best-effort interaction response for room-management commands."""
+    if interaction.response.is_done():
+        return False
+    remaining = _discord_outbound_block_remaining()
+    if remaining > 0:
+        log.warning(
+            "Discord room-management interaction skipped during outbound cooldown | remaining=%.1fs | no HTTP sent",
+            remaining,
+        )
+        return False
+    try:
+        await asyncio.wait_for(
+            interaction.response.send_message(
+                content,
+                ephemeral=ephemeral,
+                allowed_mentions=ALLOWED_MENTIONS,
+            ),
+            timeout=5,
+        )
+        return True
+    except asyncio.TimeoutError:
+        log.warning("Discord room-management interaction timed out safely")
+    except discord.HTTPException as exc:
+        if getattr(exc, "status", None) == 429:
+            _record_discord_outbound_429(exc, context="translation-room:interaction")
+        else:
+            log.warning(
+                "Discord room-management interaction failed | status=%s",
+                getattr(exc, "status", None),
+            )
+    except Exception as exc:
+        log.warning("Discord room-management interaction failed safely | %r", exc)
+    return False
+
+
+@bot.tree.command(name="setroom", description="กำหนดห้องที่ JAVIS จะอ่านข้อความและแปล")
+@app_commands.describe(channel="เลือกห้องข้อความที่ต้องการเปิดการแปล")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def setroom_command(interaction: discord.Interaction, channel: discord.TextChannel) -> None:
+    if interaction.guild is None:
+        await _safe_interaction_message(
+            interaction,
+            "❌ คำสั่งนี้ใช้ได้เฉพาะในเซิร์ฟเวอร์ Discord",
+        )
+        return
+
+    guild_key = str(interaction.guild.id)
+    async with TRANSLATION_ROOMS_IO_LOCK:
+        room_ids = TRANSLATION_ROOMS.setdefault(guild_key, set())
+        already_enabled = channel.id in room_ids
+        room_ids.add(channel.id)
+        if not already_enabled:
+            await asyncio.to_thread(_save_translation_rooms_sync)
+
+    text = (
+        f"ℹ️ ห้อง {channel.mention} เปิดการแปลของ JAVIS อยู่แล้ว"
+        if already_enabled
+        else f"✅ เปิดการแปลของ JAVIS สำหรับห้อง {channel.mention} แล้ว"
+    )
+    await _safe_interaction_message(interaction, text)
+    log.info(
+        "Translation room enabled | guild=%s | channel=%s | changed=%s",
+        interaction.guild.id,
+        channel.id,
+        not already_enabled,
+    )
+
+
+@bot.tree.command(name="delroom", description="ลบห้องออกจากรายการห้องที่ JAVIS จะแปล")
+@app_commands.describe(channel="เลือกห้องข้อความที่จะปิดการแปล")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def delroom_command(interaction: discord.Interaction, channel: discord.TextChannel) -> None:
+    if interaction.guild is None:
+        await _safe_interaction_message(
+            interaction,
+            "❌ คำสั่งนี้ใช้ได้เฉพาะในเซิร์ฟเวอร์ Discord",
+        )
+        return
+
+    guild_key = str(interaction.guild.id)
+    removed = False
+    async with TRANSLATION_ROOMS_IO_LOCK:
+        room_ids = TRANSLATION_ROOMS.get(guild_key, set())
+        if channel.id in room_ids:
+            room_ids.remove(channel.id)
+            removed = True
+            if room_ids:
+                TRANSLATION_ROOMS[guild_key] = room_ids
+            else:
+                TRANSLATION_ROOMS.pop(guild_key, None)
+            await asyncio.to_thread(_save_translation_rooms_sync)
+
+    text = (
+        f"✅ ลบห้อง {channel.mention} ออกจากรายการแปลแล้ว"
+        if removed
+        else f"ℹ️ ห้อง {channel.mention} ไม่ได้อยู่ในรายการแปล"
+    )
+    await _safe_interaction_message(interaction, text)
+    log.info(
+        "Translation room disabled | guild=%s | channel=%s | changed=%s",
+        interaction.guild.id,
+        channel.id,
+        removed,
+    )
+
+
+@bot.tree.command(name="roomlist", description="ดูรายชื่อห้องที่ JAVIS เปิดการแปลไว้")
+async def roomlist_command(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await _safe_interaction_message(
+            interaction,
+            "❌ คำสั่งนี้ใช้ได้เฉพาะในเซิร์ฟเวอร์ Discord",
+        )
+        return
+
+    room_ids = sorted(_translation_room_ids(interaction.guild.id))
+    if not room_ids:
+        text = "ℹ️ ยังไม่มีห้องที่เปิดการแปลของ JAVIS ในเซิร์ฟเวอร์นี้\nใช้ `/setroom` เพื่อเลือกห้อง"
+    else:
+        mentions = []
+        stale_ids = []
+        for channel_id in room_ids:
+            channel = interaction.guild.get_channel(channel_id)
+            if isinstance(channel, discord.TextChannel):
+                mentions.append(channel.mention)
+            else:
+                stale_ids.append(channel_id)
+        if stale_ids:
+            async with TRANSLATION_ROOMS_IO_LOCK:
+                current = TRANSLATION_ROOMS.get(str(interaction.guild.id), set())
+                current.difference_update(stale_ids)
+                if current:
+                    TRANSLATION_ROOMS[str(interaction.guild.id)] = current
+                else:
+                    TRANSLATION_ROOMS.pop(str(interaction.guild.id), None)
+                await asyncio.to_thread(_save_translation_rooms_sync)
+        if mentions:
+            text = "📚 ห้องที่เปิดการแปลของ JAVIS:\n" + "\n".join(
+                f"• {mention}" for mention in mentions
+            )
+        else:
+            text = "ℹ️ ไม่มีห้องที่ยังใช้งานได้ในรายการแปล\nใช้ `/setroom` เพื่อเลือกห้อง"
+
+    await _safe_interaction_message(interaction, text)
+
+
+@bot.tree.error
+async def _translation_room_tree_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+) -> None:
+    if isinstance(error, app_commands.MissingPermissions):
+        await _safe_interaction_message(
+            interaction,
+            "❌ คำสั่งนี้ต้องมีสิทธิ์ Manage Channels",
+        )
+        return
+    log.warning("Discord slash-command error | %r", error)
+    await _safe_interaction_message(
+        interaction,
+        "❌ เกิดข้อผิดพลาดกับคำสั่ง Slash Command กรุณาลองใหม่",
     )
 
 
@@ -1173,6 +1515,13 @@ async def on_message(message: discord.Message):
     # Preserve command handling and do not translate commands.
     if message.content.startswith("!javis"):
         await bot.process_commands(message)
+        return
+
+    # Translation is opt-in per server/channel. DMs and unconfigured rooms
+    # are ignored and do not trigger Argos or Discord output requests.
+    if message.guild is None:
+        return
+    if not _is_translation_room_enabled(message.guild.id, message.channel.id):
         return
 
     content = message.content.strip()
