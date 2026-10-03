@@ -16,7 +16,7 @@ from discord.ext import commands
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.16")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.17")
 
 PORT = int(os.getenv("PORT", "10000"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "1200"))
@@ -256,10 +256,113 @@ def protect_common_content(text: str, protector: Protector) -> str:
 
 
 def prepare_for_translation(text: str, source_lang: str) -> tuple[str, Protector]:
+    """Prepare only ordinary text for the model.
+
+    TWOM terms are intentionally NOT replaced with placeholder tokens here.
+    In v1.0.16 those placeholders were sent through SentencePiece/CTranslate2,
+    which can make the model copy/drop the source term and produce mixed-language
+    output. TWOM terms are now handled as explicit glossary spans in
+    split_translation_spans() before the model is called.
+    """
     protector = Protector()
     prepared = protect_common_content(text, protector)
-    prepared = protect_twom_terms(prepared, source_lang, protector)
     return prepared, protector
+
+
+def _twom_glossary_for(source_lang: str, target_lang: str) -> list[tuple[str, str]]:
+    """Return source aliases and their target-language replacements.
+
+    Matching is source-language aware and longest-first. Empty/missing target
+    values are ignored so an incomplete dictionary entry never removes text.
+    """
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in TWOM_DICTIONARY:
+        if not isinstance(item, dict):
+            continue
+        aliases = item.get(source_lang, [])
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        target_value = item.get(target_lang)
+        if isinstance(target_value, str):
+            target = target_value.strip()
+        elif isinstance(target_value, list):
+            target = next((str(v).strip() for v in target_value if isinstance(v, str) and v.strip()), "")
+        else:
+            target = ""
+        if not target:
+            continue
+        for alias in aliases:
+            if not isinstance(alias, str):
+                continue
+            alias = alias.strip()
+            if not alias:
+                continue
+            key = alias.casefold() if re.search(r"[A-Za-z]", alias) else alias
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append((alias, target))
+    pairs.sort(key=lambda item: len(item[0]), reverse=True)
+    return pairs
+
+
+def split_translation_spans(
+    text: str, source_lang: str, target_lang: str
+) -> list[tuple[str, str, str | None]]:
+    """Split text into model text, non-translatable text, and TWOM glossary spans.
+
+    URLs/mentions/emoji remain byte-for-byte unchanged. TWOM terms are replaced
+    directly with their target-language glossary value instead of placeholder
+    tokens, so the translation model never receives artificial JAVISX... tokens.
+    """
+    glossary = _twom_glossary_for(source_lang, target_lang)
+    if not glossary:
+        return [("translate", frag, None) if not protected else ("protected", frag, None)
+                for protected, frag in split_non_translatable_spans(text)]
+
+    latin_patterns: list[str] = []
+    plain_patterns: list[str] = []
+    target_by_alias: dict[str, str] = {}
+    for alias, target in glossary:
+        key = alias.casefold() if re.search(r"[A-Za-z]", alias) else alias
+        target_by_alias[key] = target
+        if re.search(r"[A-Za-z]", alias):
+            latin_patterns.append(
+                rf"(?<![A-Za-z0-9_]){re.escape(alias)}(?![A-Za-z0-9_])"
+            )
+        else:
+            plain_patterns.append(re.escape(alias))
+
+    alternatives = latin_patterns + plain_patterns
+    if not alternatives:
+        return [("translate", frag, None) if not protected else ("protected", frag, None)
+                for protected, frag in split_non_translatable_spans(text)]
+
+    glossary_re = re.compile("|".join(alternatives), re.IGNORECASE)
+    result: list[tuple[str, str, str | None]] = []
+
+    for protected, fragment in split_non_translatable_spans(text):
+        if protected or not fragment:
+            result.append(("protected", fragment, None))
+            continue
+
+        last = 0
+        for match in glossary_re.finditer(fragment):
+            if match.start() > last:
+                result.append(("translate", fragment[last:match.start()], None))
+            alias = match.group(0)
+            key = alias.casefold() if re.search(r"[A-Za-z]", alias) else alias
+            target = target_by_alias.get(key)
+            if target is not None:
+                result.append(("twom", alias, target))
+            else:
+                result.append(("translate", alias, None))
+            last = match.end()
+        if last < len(fragment):
+            result.append(("translate", fragment[last:], None))
+
+    return result or [("translate", text, None)]
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +547,7 @@ def main():
                 {
                     "ok": True,
                     "results": result,
-                    "runner": "ct2-direct-argos-compatible-v1.0.16",
+                    "runner": "ct2-direct-argos-compatible-v1.0.17",
                     "source": source_lang,
                     "target": target_lang,
                 },
@@ -601,21 +704,30 @@ def translate_sync(text: str, source_lang: str, target_lang: str) -> str:
     if ARGOS_WORKER is None:
         raise RuntimeError("Argos isolated runner is not started")
 
-    spans = split_non_translatable_spans(text)
+    spans = split_translation_spans(text, source_lang, target_lang)
     output: list[str] = []
     jobs: list[tuple[int, Protector, str, str, str]] = []
+    glossary_count = 0
 
-    for idx, (is_protected, fragment) in enumerate(spans):
-        if is_protected or not fragment:
+    for kind, fragment, glossary_target in spans:
+        if kind == "protected":
             output.append(fragment)
             continue
+        if kind == "twom":
+            # Direct glossary replacement: the model never sees an artificial
+            # placeholder, so it cannot leak the source-language term.
+            output.append(glossary_target if glossary_target is not None else fragment)
+            glossary_count += 1
+            continue
+
         left, core, right = _preserve_whitespace(fragment)
         if not core:
             output.append(fragment)
             continue
         prepared, protector = prepare_for_translation(core, source_lang)
+        output_index = len(output)
         output.append(None)  # type: ignore[arg-type]
-        jobs.append((idx, protector, left, right, prepared))
+        jobs.append((output_index, protector, left, right, prepared))
 
     if jobs:
         results = ARGOS_WORKER.translate_many(
@@ -623,15 +735,16 @@ def translate_sync(text: str, source_lang: str, target_lang: str) -> str:
         )
         for job, result in zip(jobs, results):
             idx, protector, left, right, _prepared = job
-            restored = restore_twom_terms(result, protector, target_lang)
+            restored = protector.restore(result)
             output[idx] = left + restored + right
 
     combined = "".join(output)
     log.info(
-        "Preserved non-translatable spans | source=%s | target=%s | protected_spans=%d | translated_spans=%d",
+        "Preserved non-translatable spans | source=%s | target=%s | protected_spans=%d | glossary_spans=%d | translated_spans=%d",
         source_lang,
         target_lang,
-        sum(1 for protected, _ in spans if protected),
+        sum(1 for kind, _, _ in spans if kind == "protected"),
+        glossary_count,
         len(jobs),
     )
     return combined
@@ -732,9 +845,9 @@ async def health(request: web.Request) -> web.Response:
             "korean_engine": os.getenv("ARGOS_KO_ENGINE", "argos-native"),
             "korean_beam_size": int(os.getenv("ARGOS_KO_BEAM_SIZE", "4")),
             "translation_worker_alive": worker_alive,
-            "translation_runner_mode": "ct2-direct-argos-compatible-v1.0.16-per-target",
-            "quality_mode": "argos-compatible-decode-pieces+raw-target-prefix+pivot-fix",
-            "decode_mode": "SentencePiece.decode_pieces + U+2581 normalization",
+            "translation_runner_mode": "ct2-direct-argos-compatible-v1.0.17-per-target",
+            "quality_mode": "argos-compatible-decode-pieces+raw-target-prefix+pivot-fix+twom-span-glossary",
+            "decode_mode": "SentencePiece.decode_pieces + U+2581 normalization + no-TWOM-placeholders",
             "pivot_mode": "th->en->ko and ko->en->th",
             "non_translatable_mode": "segment-preserve",
             "response_mode": "progressive-first-result-then-edit",
