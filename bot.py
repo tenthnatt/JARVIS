@@ -7,6 +7,7 @@ import re
 import time
 import subprocess
 import sys
+import signal
 from pathlib import Path
 
 from aiohttp import web
@@ -16,7 +17,7 @@ from discord.ext import commands
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.20")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.21")
 
 PORT = int(os.getenv("PORT", "10000"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "1200"))
@@ -699,6 +700,23 @@ DISCORD_LOGIN_RETRY_COUNT = 0
 DISCORD_LOGIN_RETRY_AFTER = 0.0
 DISCORD_LOGIN_SESSION_RECOVERY_COUNT = 0
 
+# Render zero-downtime deploys start a new instance before SIGTERM-ing the old one.
+# Delay only the FIRST Discord login attempt so the old Gateway has time to hand over.
+DISCORD_STARTUP_HANDOVER_DELAY_SECONDS = max(
+    0.0,
+    float(os.getenv("DISCORD_STARTUP_HANDOVER_DELAY", "75")),
+)
+DISCORD_SHUTDOWN_EVENT = asyncio.Event()
+DISCORD_SHUTDOWN_REQUESTED = False
+DISCORD_LOGIN_LAST_STATUS = 0
+DISCORD_LOGIN_LAST_SCOPE = ""
+DISCORD_LOGIN_LAST_GLOBAL = False
+DISCORD_LOGIN_LAST_RETRY_AFTER = 0.0
+DISCORD_LOGIN_LAST_CF_RAY = ""
+DISCORD_LOGIN_LAST_VIA = ""
+DISCORD_LOGIN_LAST_SERVER = ""
+DISCORD_LOGIN_LAST_MESSAGE = ""
+
 
 def _preserve_whitespace(fragment: str) -> tuple[str, str, str]:
     left = fragment[: len(fragment) - len(fragment.lstrip())]
@@ -868,6 +886,16 @@ async def health(request: web.Request) -> web.Response:
             "discord_login_retry_count": DISCORD_LOGIN_RETRY_COUNT,
             "discord_login_retry_after": DISCORD_LOGIN_RETRY_AFTER,
             "discord_login_session_recovery_count": DISCORD_LOGIN_SESSION_RECOVERY_COUNT,
+            "discord_startup_handover_delay_seconds": DISCORD_STARTUP_HANDOVER_DELAY_SECONDS,
+            "discord_shutdown_requested": DISCORD_SHUTDOWN_REQUESTED,
+            "discord_login_last_status": DISCORD_LOGIN_LAST_STATUS,
+            "discord_login_last_scope": DISCORD_LOGIN_LAST_SCOPE,
+            "discord_login_last_global": DISCORD_LOGIN_LAST_GLOBAL,
+            "discord_login_last_retry_after": DISCORD_LOGIN_LAST_RETRY_AFTER,
+            "discord_login_last_cf_ray": DISCORD_LOGIN_LAST_CF_RAY,
+            "discord_login_last_via": DISCORD_LOGIN_LAST_VIA,
+            "discord_login_last_server": DISCORD_LOGIN_LAST_SERVER,
+            "discord_login_last_message": DISCORD_LOGIN_LAST_MESSAGE,
         },
         status=200 if token_configured and worker_alive else 503,
     )
@@ -1200,15 +1228,116 @@ async def _reset_discord_client_state_after_login_error(reason: str) -> None:
         log.exception("Discord client state reset after login error failed | reason=%s", reason)
 
 
+def _discord_http_429_diagnostics(exc: Exception) -> dict[str, object]:
+    """Extract only safe 429 metadata needed to identify the blocking layer."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) or {}
+
+    def header(*names: str) -> str:
+        for name in names:
+            try:
+                value = headers.get(name)
+            except Exception:
+                value = None
+            if value is not None:
+                return str(value)
+        return ""
+
+    text = str(getattr(exc, "text", "") or "")
+    if len(text) > 500:
+        text = text[:500]
+
+    return {
+        "scope": header("X-RateLimit-Scope", "x-ratelimit-scope"),
+        "global": header("X-RateLimit-Global", "x-ratelimit-global").lower() == "true",
+        "limit": header("X-RateLimit-Limit", "x-ratelimit-limit"),
+        "remaining": header("X-RateLimit-Remaining", "x-ratelimit-remaining"),
+        "reset_after": header("X-RateLimit-Reset-After", "x-ratelimit-reset-after"),
+        "bucket": header("X-RateLimit-Bucket", "x-ratelimit-bucket"),
+        "retry_after_header": header("Retry-After", "retry-after"),
+        "cf_ray": header("CF-Ray", "cf-ray"),
+        "via": header("Via", "via"),
+        "server": header("Server", "server"),
+        "content_type": header("Content-Type", "content-type"),
+        "text": text,
+    }
+
+
+def _install_discord_shutdown_signal_handlers() -> None:
+    """Let Render SIGTERM close the Gateway cleanly during zero-downtime handover."""
+    global DISCORD_SHUTDOWN_REQUESTED
+    DISCORD_SHUTDOWN_REQUESTED = False
+    DISCORD_SHUTDOWN_EVENT.clear()
+    loop = asyncio.get_running_loop()
+
+    def _request_shutdown(signum):
+        global DISCORD_SHUTDOWN_REQUESTED
+        DISCORD_SHUTDOWN_REQUESTED = True
+        try:
+            signal_name = getattr(signal.Signals(signum), "name", str(signum))
+        except Exception:
+            signal_name = str(signum)
+        log.warning("Discord shutdown requested by %s | graceful handover", signal_name)
+        DISCORD_SHUTDOWN_EVENT.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _request_shutdown, sig)
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass
+
+
+async def _wait_for_discord_startup_handover() -> bool:
+    """Hold only the first Gateway/REST login during a Render instance handover."""
+    global DISCORD_LOGIN_STATE, DISCORD_LOGIN_RETRY_AFTER
+
+    delay = DISCORD_STARTUP_HANDOVER_DELAY_SECONDS
+    if delay <= 0:
+        return True
+
+    DISCORD_LOGIN_STATE = "handover_waiting"
+    DISCORD_LOGIN_RETRY_AFTER = delay
+    log.warning(
+        "Discord startup handover hold | wait=%.1fs | reason=Render zero-downtime deploy protection | no Discord request sent",
+        delay,
+    )
+    try:
+        await asyncio.wait_for(DISCORD_SHUTDOWN_EVENT.wait(), timeout=delay)
+        DISCORD_LOGIN_STATE = "shutdown_requested"
+        DISCORD_LOGIN_RETRY_AFTER = 0.0
+        return False
+    except asyncio.TimeoutError:
+        DISCORD_LOGIN_RETRY_AFTER = 0.0
+        if DISCORD_SHUTDOWN_EVENT.is_set():
+            DISCORD_LOGIN_STATE = "shutdown_requested"
+            return False
+        log.info("Discord startup handover hold complete | first Discord login may proceed")
+        return True
+
+
 async def _start_discord_with_rate_limit_retry(discord_token: str) -> None:
     """Start Discord and survive login 429s without Render restart loops."""
     global DISCORD_LOGIN_STATE, DISCORD_LOGIN_RETRY_COUNT, DISCORD_LOGIN_RETRY_AFTER
     global DISCORD_LOGIN_SESSION_RECOVERY_COUNT
+    global DISCORD_LOGIN_LAST_STATUS, DISCORD_LOGIN_LAST_SCOPE, DISCORD_LOGIN_LAST_GLOBAL
+    global DISCORD_LOGIN_LAST_RETRY_AFTER, DISCORD_LOGIN_LAST_CF_RAY, DISCORD_LOGIN_LAST_VIA
+    global DISCORD_LOGIN_LAST_SERVER, DISCORD_LOGIN_LAST_MESSAGE
 
     fallback_attempt = 0
     session_recovery_backoff = 30.0
+    handover_delay_done = False
 
     while True:
+        if DISCORD_SHUTDOWN_EVENT.is_set():
+            DISCORD_LOGIN_STATE = "shutdown_requested"
+            DISCORD_LOGIN_RETRY_AFTER = 0.0
+            return
+
+        if not handover_delay_done:
+            if not await _wait_for_discord_startup_handover():
+                return
+            handover_delay_done = True
+
         try:
             DISCORD_LOGIN_STATE = "connecting"
             DISCORD_LOGIN_RETRY_AFTER = 0.0
@@ -1227,10 +1356,17 @@ async def _start_discord_with_rate_limit_retry(discord_token: str) -> None:
                 wait_seconds, source = _discord_retry_after_seconds(exc, fallback)
                 DISCORD_LOGIN_RETRY_AFTER = wait_seconds
 
-                response = getattr(exc, "response", None)
-                headers = getattr(response, "headers", None) or {}
-                scope = headers.get("X-RateLimit-Scope", "unknown") if hasattr(headers, "get") else "unknown"
-                global_header = headers.get("X-RateLimit-Global", "false") if hasattr(headers, "get") else "false"
+                diag = _discord_http_429_diagnostics(exc)
+                scope = str(diag.get("scope") or "unknown")
+                global_header = "true" if bool(diag.get("global")) else "false"
+                DISCORD_LOGIN_LAST_STATUS = int(getattr(exc, "status", 429) or 429)
+                DISCORD_LOGIN_LAST_SCOPE = scope
+                DISCORD_LOGIN_LAST_GLOBAL = bool(diag.get("global"))
+                DISCORD_LOGIN_LAST_RETRY_AFTER = wait_seconds
+                DISCORD_LOGIN_LAST_CF_RAY = str(diag.get("cf_ray") or "")
+                DISCORD_LOGIN_LAST_VIA = str(diag.get("via") or "")
+                DISCORD_LOGIN_LAST_SERVER = str(diag.get("server") or "")
+                DISCORD_LOGIN_LAST_MESSAGE = str(diag.get("text") or "")
 
                 DISCORD_LOGIN_STATE = "rate_limited_waiting"
                 log.warning(
@@ -1243,11 +1379,29 @@ async def _start_discord_with_rate_limit_retry(discord_token: str) -> None:
                     DISCORD_LOGIN_RETRY_COUNT,
                 )
 
+                log.warning(
+                    "Discord 429 diagnostics | route=static_login:/users/@me | limit=%s | remaining=%s | reset_after=%ss | bucket=%s | cf_ray=%s | via=%s | server=%s | message=%s",
+                    diag.get("limit") or "-",
+                    diag.get("remaining") or "-",
+                    diag.get("reset_after") or "-",
+                    diag.get("bucket") or "-",
+                    diag.get("cf_ray") or "-",
+                    diag.get("via") or "-",
+                    diag.get("server") or "-",
+                    diag.get("text") or "-",
+                )
+
                 # Do NOT close bot.http here. Discord explicitly tells clients
                 # to wait for Retry-After/retry_after before making another
                 # request; the existing aiohttp session can remain open.
                 await _reset_discord_client_state_after_login_error("http-429")
-                await asyncio.sleep(wait_seconds)
+                try:
+                    await asyncio.wait_for(DISCORD_SHUTDOWN_EVENT.wait(), timeout=wait_seconds)
+                    DISCORD_LOGIN_STATE = "shutdown_requested"
+                    DISCORD_LOGIN_RETRY_AFTER = 0.0
+                    return
+                except asyncio.TimeoutError:
+                    pass
 
                 DISCORD_LOGIN_STATE = "retrying"
                 DISCORD_LOGIN_RETRY_AFTER = 0.0
@@ -1264,7 +1418,13 @@ async def _start_discord_with_rate_limit_retry(discord_token: str) -> None:
                     wait_seconds,
                 )
                 await _reset_discord_client_state_after_login_error("closed-session")
-                await asyncio.sleep(wait_seconds)
+                try:
+                    await asyncio.wait_for(DISCORD_SHUTDOWN_EVENT.wait(), timeout=wait_seconds)
+                    DISCORD_LOGIN_STATE = "shutdown_requested"
+                    DISCORD_LOGIN_RETRY_AFTER = 0.0
+                    return
+                except asyncio.TimeoutError:
+                    pass
                 session_recovery_backoff = min(session_recovery_backoff * 2.0, 300.0)
                 DISCORD_LOGIN_STATE = "retrying"
                 DISCORD_LOGIN_RETRY_AFTER = 0.0
@@ -1299,9 +1459,33 @@ async def main():
     ARGOS_WORKER = ArgosWorkerClient()
     ARGOS_WORKER.start()
     runner = await start_http_server()
+    _install_discord_shutdown_signal_handlers()
+    discord_task = asyncio.create_task(
+        _start_discord_with_rate_limit_retry(discord_token),
+        name="javis-discord-startup",
+    )
+    shutdown_task = asyncio.create_task(
+        DISCORD_SHUTDOWN_EVENT.wait(),
+        name="javis-discord-shutdown-wait",
+    )
     try:
-        await _start_discord_with_rate_limit_retry(discord_token)
+        done, _ = await asyncio.wait(
+            {discord_task, shutdown_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if shutdown_task in done:
+            DISCORD_LOGIN_STATE = "shutdown_requested"
+            if not bot.is_closed():
+                await bot.close()
+            if not discord_task.done():
+                discord_task.cancel()
+            await asyncio.gather(discord_task, return_exceptions=True)
+        else:
+            await discord_task
     finally:
+        if not shutdown_task.done():
+            shutdown_task.cancel()
+        await asyncio.gather(shutdown_task, return_exceptions=True)
         await runner.cleanup()
         if ARGOS_WORKER is not None:
             ARGOS_WORKER.shutdown()

@@ -7,8 +7,13 @@ needs those settings. The Discord bot itself remains in bot.py.
 import asyncio
 import os
 
-JAVIS_VERSION = "1.0.20"
+JAVIS_VERSION = "1.0.21"
 os.environ["JAVIS_VERSION"] = JAVIS_VERSION
+
+# Render zero-downtime deploy protection: Render starts a new instance before
+# sending SIGTERM to the old instance. Keep the HTTP health server available, but
+# delay the first Discord login so the old Gateway can shut down cleanly first.
+os.environ.setdefault("DISCORD_STARTUP_HANDOVER_DELAY", "75")
 
 # Runtime quantization: CTranslate2 models are loaded as INT8 in RAM.
 # Render Environment Variables may override these values, but these defaults
