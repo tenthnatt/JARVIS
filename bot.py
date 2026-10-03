@@ -16,7 +16,7 @@ from discord.ext import commands
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.15")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.16")
 
 PORT = int(os.getenv("PORT", "10000"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "1200"))
@@ -380,9 +380,9 @@ def _translate_direct(package_dir, metadata, texts):
         target_prefix = None
         prefix = str(metadata.get("target_prefix", "") or "")
         if prefix:
-            prefix_tokens = tokenizer.encode(prefix, out_type=str)
-            if prefix_tokens:
-                target_prefix = [prefix_tokens] * len(tokenized)
+            # Argos passes target_prefix as the raw target vocabulary token.
+            # Do not SentencePiece-encode it; that changes the prefix semantics.
+            target_prefix = [[prefix]] * len(tokenized)
 
         results = translator.translate_batch(
             tokenized,
@@ -404,10 +404,16 @@ def _translate_direct(package_dir, metadata, texts):
         for result in results:
             if not result.hypotheses:
                 raise RuntimeError("CTranslate2 returned no hypothesis")
-            value = tokenizer.decode(result.hypotheses[0]).strip()
+            # Match Argos Translate's current SentencePiece detokenization path.
+            # Using SentencePiece.decode() here can leave literal U+2581 markers
+            # in the Discord output; Argos uses decode_pieces() instead.
+            value = tokenizer.decode_pieces(result.hypotheses[0])
+            value = value.replace("▁", " ")
             if prefix and value.startswith(prefix):
-                value = value[len(prefix):].lstrip()
-            output.append(value)
+                value = value[len(prefix):]
+            if value.startswith(" "):
+                value = value[1:]
+            output.append(value.strip())
         return output
     finally:
         del translator
@@ -438,7 +444,7 @@ def main():
                 {
                     "ok": True,
                     "results": result,
-                    "runner": "ct2-direct-argos-compatible-v1.0.15",
+                    "runner": "ct2-direct-argos-compatible-v1.0.16",
                     "source": source_lang,
                     "target": target_lang,
                 },
@@ -487,6 +493,8 @@ class ArgosWorkerClient:
         self.ensure_alive()
         if not texts:
             return []
+
+        started_at = time.monotonic()
 
         payload = json.dumps(
             {"texts": texts, "source": source_lang, "target": target_lang},
@@ -561,11 +569,13 @@ class ArgosWorkerClient:
             )
 
         results = [str(x) for x in results]
+        elapsed_ms = int((time.monotonic() - started_at) * 1000)
         log.info(
-            "Argos target complete | %s->%s | result_chars=%d | subprocess_exit=%s",
+            "Argos target complete | %s->%s | result_chars=%d | elapsed_ms=%d | subprocess_exit=%s",
             source_lang,
             target_lang,
             sum(len(x) for x in results),
+            elapsed_ms,
             completed.returncode,
         )
         return results
@@ -722,10 +732,12 @@ async def health(request: web.Request) -> web.Response:
             "korean_engine": os.getenv("ARGOS_KO_ENGINE", "argos-native"),
             "korean_beam_size": int(os.getenv("ARGOS_KO_BEAM_SIZE", "4")),
             "translation_worker_alive": worker_alive,
-            "translation_runner_mode": "ct2-direct-argos-compatible-v1.0.15-per-target",
-            "quality_mode": "argos-compatible-decoding+pivot-fix",
+            "translation_runner_mode": "ct2-direct-argos-compatible-v1.0.16-per-target",
+            "quality_mode": "argos-compatible-decode-pieces+raw-target-prefix+pivot-fix",
+            "decode_mode": "SentencePiece.decode_pieces + U+2581 normalization",
             "pivot_mode": "th->en->ko and ko->en->th",
             "non_translatable_mode": "segment-preserve",
+            "response_mode": "progressive-first-result-then-edit",
             "argos_packages_dir": os.getenv("ARGOS_PACKAGES_DIR", ""),
             "discord_token_configured": token_configured,
             "discord_ready": bot.is_ready(),
@@ -844,13 +856,13 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 async def send_safe_translation(
     message: discord.Message,
     content: str,
-) -> None:
+) -> discord.Message:
     # Use channel.send as the primary path. It is the simplest Discord API
     # operation for this text-only bot and avoids reply-reference edge cases.
     # Keep reply() as a fallback so existing channel behavior still works.
     try:
         log.info("Discord send start | channel=%s | chars=%d", getattr(message.channel, "id", "?"), len(content))
-        await asyncio.wait_for(
+        sent = await asyncio.wait_for(
             message.channel.send(
                 content,
                 allowed_mentions=ALLOWED_MENTIONS,
@@ -858,11 +870,11 @@ async def send_safe_translation(
             timeout=20,
         )
         log.info("Discord send complete | channel=%s | chars=%d", getattr(message.channel, "id", "?"), len(content))
-        return
+        return sent
     except (asyncio.TimeoutError, discord.Forbidden, discord.HTTPException):
         log.exception("Discord channel.send failed; falling back to message.reply")
 
-    await asyncio.wait_for(
+    sent = await asyncio.wait_for(
         message.reply(
             content,
             mention_author=False,
@@ -871,6 +883,7 @@ async def send_safe_translation(
         timeout=20,
     )
     log.info("Discord reply fallback complete | channel=%s | chars=%d", getattr(message.channel, "id", "?"), len(content))
+    return sent
 
 
 @bot.event
@@ -897,18 +910,84 @@ async def on_message(message: discord.Message):
         return
 
     try:
-        async with TRANSLATION_LOCK:
-            result = await asyncio.to_thread(translate_all_sync, content)
-        response = build_response(result)
-        log.info(
-            "Translation completed | source=%s | response_chars=%d",
-            result["source"],
-            len(response),
-        )
+        source_lang = detect_language(content)
+        clean = strip_language_prefix(content).strip()
+        if not clean:
+            return
 
-        if len(response) <= 1900:
-            await send_safe_translation(message, response)
-        else:
+        # Keep the memory-safe one-target-at-a-time architecture, but expose
+        # the first completed translation immediately and edit that same
+        # Discord message after the second target finishes. This improves
+        # perceived response time without loading two models concurrently.
+        async with TRANSLATION_LOCK:
+            log.info("Translating message | source=%s | chars=%d", source_lang, len(clean))
+
+            result: dict[str, str] = {"source": source_lang, "en": "", "th": "", "ko": "", "errors": {}}
+            sent_message: discord.Message | None = None
+
+            async def run_target_async(label: str, source: str, target: str, text: str) -> str | None:
+                try:
+                    value = await asyncio.to_thread(translate_sync, text, source, target)
+                    if not value.strip():
+                        raise RuntimeError(f"Empty translation result: {source}->{target}")
+                    result[label] = value
+                    return value
+                except Exception as exc:
+                    result.setdefault("errors", {})[f"{source}->{target}"] = str(exc)
+                    log.exception("Target translation failed | %s->%s", source, target)
+                    return None
+
+            def first_response(label: str) -> str:
+                return f"[{LANG_NAMES[label]}] {result[label]}"
+
+            if source_lang == "en":
+                first = await run_target_async("th", "en", "th", clean)
+                if first:
+                    sent_message = await send_safe_translation(message, first_response("th"))
+                second = await run_target_async("ko", "en", "ko", clean)
+            elif source_lang == "th":
+                first = await run_target_async("en", "th", "en", clean)
+                if first:
+                    sent_message = await send_safe_translation(message, first_response("en"))
+                second = await run_target_async("ko", "en", "ko", first) if first else None
+            else:
+                first = await run_target_async("en", "ko", "en", clean)
+                if first:
+                    sent_message = await send_safe_translation(message, first_response("en"))
+                second = await run_target_async("th", "en", "th", first) if first else None
+
+            response = build_response(result)
+            log.info(
+                "Translation completed | source=%s | response_chars=%d | response_mode=progressive-edit",
+                result["source"],
+                len(response),
+            )
+
+            if sent_message is not None and len(response) <= 1900:
+                if response != sent_message.content:
+                    log.info(
+                        "Discord edit start | channel=%s | chars=%d",
+                        getattr(message.channel, "id", "?"),
+                        len(response),
+                    )
+                    await asyncio.wait_for(
+                        sent_message.edit(content=response, allowed_mentions=ALLOWED_MENTIONS),
+                        timeout=20,
+                    )
+                    log.info(
+                        "Discord edit complete | channel=%s | chars=%d",
+                        getattr(message.channel, "id", "?"),
+                        len(response),
+                    )
+                return
+
+            # Fallback for unusually large output or when no first target
+            # completed. This keeps the existing safe send/chunking behavior.
+            if len(response) <= 1900:
+                if sent_message is None:
+                    await send_safe_translation(message, response)
+                return
+
             chunks = []
             current = ""
             for line in response.splitlines():
@@ -922,14 +1001,17 @@ async def on_message(message: discord.Message):
             if current:
                 chunks.append(current)
 
-            # First chunk uses reply for the normal UX; fallback to channel.send
-            # is handled inside send_safe_translation.
-            await send_safe_translation(message, chunks[0])
-            for chunk in chunks[1:]:
-                await message.channel.send(
-                    chunk,
-                    allowed_mentions=ALLOWED_MENTIONS,
+            if sent_message is not None:
+                await asyncio.wait_for(
+                    sent_message.edit(content=chunks[0], allowed_mentions=ALLOWED_MENTIONS),
+                    timeout=20,
                 )
+                for chunk in chunks[1:]:
+                    await message.channel.send(chunk, allowed_mentions=ALLOWED_MENTIONS)
+            else:
+                await send_safe_translation(message, chunks[0])
+                for chunk in chunks[1:]:
+                    await message.channel.send(chunk, allowed_mentions=ALLOWED_MENTIONS)
     except Exception as exc:
         log.exception("Translation failed")
         await send_safe_translation(

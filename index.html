@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>JAVIS — TWOM Translator v1.0.15</title>
+  <title>JAVIS — TWOM Translator v1.0.16</title>
   <style>
     :root { color-scheme: dark; }
     body { margin:0; font-family:system-ui,-apple-system,Segoe UI,sans-serif; background:#0f1115; color:#f3f4f6; }
@@ -28,7 +28,7 @@
   <h1>JAVIS — TWOM Auto Translator</h1>
   <p id="message">กำลังตรวจสอบสถานะบริการ...</p>
   <div class="grid">
-    <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.15</div></div>
+    <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.16</div></div>
     <div class="item"><div class="label">Languages</div><div class="value">TH → EN + KO<br>EN → TH + KO<br>KO → EN + TH</div></div>
     <div class="item"><div class="label">Engine</div><div class="value">Argos + CTranslate2</div></div>
     <div class="item"><div class="label">Runtime Quantization</div><div id="compute" class="value">Checking...</div></div>
@@ -49,6 +49,8 @@
     <div class="item"><div class="label">Non-translatable</div><div class="value">URLs / Discord emoji / Unicode emoji are preserved and never translated; URL/emoji-only messages are ignored</div></div>
     <div class="item"><div class="label">Translation Quality</div><div id="quality" class="value">Checking...</div></div>
     <div class="item"><div class="label">Pivot</div><div id="pivot" class="value">Checking...</div></div>
+    <div class="item"><div class="label">Decode</div><div id="decode" class="value">Checking...</div></div>
+    <div class="item"><div class="label">Response</div><div id="responsemode" class="value">Checking...</div></div>
     <div class="item"><div class="label">Runtime Settings</div><div class="value small">ARGOS_COMPUTE_TYPE=int8 · CPU · Batch=1 enforced</div></div>
   </div>
 </section>
@@ -69,6 +71,8 @@ async function refreshStatus() {
     document.getElementById('worker').textContent=d.translation_worker_alive ? `READY ✅ (${d.translation_runner_mode || 'direct'})` : 'OFFLINE ❌';
     document.getElementById('quality').textContent=d.quality_mode || 'unknown';
     document.getElementById('pivot').textContent=d.pivot_mode || 'unknown';
+    document.getElementById('decode').textContent=d.decode_mode || 'unknown';
+    document.getElementById('responsemode').textContent=d.response_mode || 'unknown';
     document.getElementById('packages').textContent=d.argos_packages_dir || 'default';
     document.getElementById('token').textContent=d.discord_token_configured ? 'Configured ✅' : 'Missing ❌';
     document.getElementById('discord').textContent=d.discord_ready ? 'Connected ✅' : 'Not connected ❌';
