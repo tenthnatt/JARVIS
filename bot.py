@@ -16,7 +16,7 @@ from discord.ext import commands
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.19")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.20")
 
 PORT = int(os.getenv("PORT", "10000"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "1200"))
@@ -547,7 +547,7 @@ def main():
                 {
                     "ok": True,
                     "results": result,
-                    "runner": "ct2-direct-argos-compatible-v1.0.19",
+                    "runner": "ct2-direct-argos-compatible-v1.0.20",
                     "source": source_lang,
                     "target": target_lang,
                 },
@@ -697,6 +697,7 @@ ARGOS_WORKER: ArgosWorkerClient | None = None
 DISCORD_LOGIN_STATE = "starting"
 DISCORD_LOGIN_RETRY_COUNT = 0
 DISCORD_LOGIN_RETRY_AFTER = 0.0
+DISCORD_LOGIN_SESSION_RECOVERY_COUNT = 0
 
 
 def _preserve_whitespace(fragment: str) -> tuple[str, str, str]:
@@ -854,7 +855,7 @@ async def health(request: web.Request) -> web.Response:
             "korean_engine": os.getenv("ARGOS_KO_ENGINE", "argos-native"),
             "korean_beam_size": int(os.getenv("ARGOS_KO_BEAM_SIZE", "4")),
             "translation_worker_alive": worker_alive,
-            "translation_runner_mode": "ct2-direct-argos-compatible-v1.0.19-per-target",
+            "translation_runner_mode": "ct2-direct-argos-compatible-v1.0.20-per-target",
             "quality_mode": "argos-compatible-decode-pieces+raw-target-prefix+pivot-fix+twom-span-glossary",
             "decode_mode": "SentencePiece.decode_pieces + U+2581 normalization + no-TWOM-placeholders",
             "pivot_mode": "th->en->ko and ko->en->th",
@@ -866,6 +867,7 @@ async def health(request: web.Request) -> web.Response:
             "discord_login_state": DISCORD_LOGIN_STATE,
             "discord_login_retry_count": DISCORD_LOGIN_RETRY_COUNT,
             "discord_login_retry_after": DISCORD_LOGIN_RETRY_AFTER,
+            "discord_login_session_recovery_count": DISCORD_LOGIN_SESSION_RECOVERY_COUNT,
         },
         status=200 if token_configured and worker_alive else 503,
     )
@@ -1182,30 +1184,35 @@ def _discord_retry_after_seconds(exc: object, fallback_seconds: float) -> tuple[
     return max(30.0, fallback_seconds), "fallback-backoff"
 
 
-async def _close_discord_http_session_after_login_error() -> None:
-    """Close only discord.py's HTTP session after a failed login attempt.
+async def _reset_discord_client_state_after_login_error(reason: str) -> None:
+    """Reset failed-login client state without closing a healthy HTTP session.
 
-    Do not call bot.close() here: discord.py's Client.close() also tears down
-    the client loop/state. A failed /users/@me login only needs its temporary
-    aiohttp session closed before the next static_login creates a fresh session.
+    A 429 response itself does not require closing discord.py's aiohttp session.
+    Closing that session and then trying to reuse the same Client can leave the
+    next static_login() with a closed-session RuntimeError. Client.clear() is
+    the supported way in discord.py to reopen/reset client state after a failed
+    start attempt, and its HTTP clear() only replaces an already-closed session.
     """
     try:
-        await bot.http.close()
-        bot.http.clear()
+        bot.clear()
+        log.info("Discord client state reset after login error | reason=%s", reason)
     except Exception:
-        log.exception("Discord HTTP session cleanup after login rate limit failed")
+        log.exception("Discord client state reset after login error failed | reason=%s", reason)
 
 
 async def _start_discord_with_rate_limit_retry(discord_token: str) -> None:
-    """Start Discord and survive transient HTTP 429s without Render restarts."""
+    """Start Discord and survive login 429s without Render restart loops."""
     global DISCORD_LOGIN_STATE, DISCORD_LOGIN_RETRY_COUNT, DISCORD_LOGIN_RETRY_AFTER
+    global DISCORD_LOGIN_SESSION_RECOVERY_COUNT
 
     fallback_attempt = 0
+    session_recovery_backoff = 30.0
+
     while True:
         try:
             DISCORD_LOGIN_STATE = "connecting"
             DISCORD_LOGIN_RETRY_AFTER = 0.0
-            await bot.start(discord_token)
+            await bot.start(discord_token, reconnect=True)
             DISCORD_LOGIN_STATE = "stopped"
             return
         except Exception as exc:
@@ -1213,37 +1220,58 @@ async def _start_discord_with_rate_limit_retry(discord_token: str) -> None:
             rate_limited_type = getattr(discord, "RateLimited", None)
             is_library_ratelimited = bool(rate_limited_type) and isinstance(exc, rate_limited_type)
 
-            if not (is_http_429 or is_library_ratelimited):
-                DISCORD_LOGIN_STATE = "failed"
-                raise
+            if is_http_429 or is_library_ratelimited:
+                fallback_attempt += 1
+                DISCORD_LOGIN_RETRY_COUNT += 1
+                fallback = min(30.0 * (2 ** max(0, fallback_attempt - 1)), 300.0)
+                wait_seconds, source = _discord_retry_after_seconds(exc, fallback)
+                DISCORD_LOGIN_RETRY_AFTER = wait_seconds
 
-            fallback_attempt += 1
-            DISCORD_LOGIN_RETRY_COUNT += 1
-            fallback = min(30.0 * (2 ** max(0, fallback_attempt - 1)), 300.0)
-            wait_seconds, source = _discord_retry_after_seconds(exc, fallback)
-            DISCORD_LOGIN_RETRY_AFTER = wait_seconds
+                response = getattr(exc, "response", None)
+                headers = getattr(response, "headers", None) or {}
+                scope = headers.get("X-RateLimit-Scope", "unknown") if hasattr(headers, "get") else "unknown"
+                global_header = headers.get("X-RateLimit-Global", "false") if hasattr(headers, "get") else "false"
 
-            response = getattr(exc, "response", None)
-            headers = getattr(response, "headers", None) or {}
-            scope = headers.get("X-RateLimit-Scope", "unknown") if hasattr(headers, "get") else "unknown"
-            global_header = headers.get("X-RateLimit-Global", "false") if hasattr(headers, "get") else "false"
+                DISCORD_LOGIN_STATE = "rate_limited_waiting"
+                log.warning(
+                    "Discord login rate-limited | status=%s | scope=%s | global=%s | retry_after=%.3fs | source=%s | retry_count=%d | keeping service alive",
+                    getattr(exc, "status", 429),
+                    scope,
+                    global_header,
+                    wait_seconds,
+                    source,
+                    DISCORD_LOGIN_RETRY_COUNT,
+                )
 
-            DISCORD_LOGIN_STATE = "rate_limited_waiting"
-            log.warning(
-                "Discord login rate-limited | status=%s | scope=%s | global=%s | retry_after=%.3fs | source=%s | retry_count=%d | keeping service alive",
-                getattr(exc, "status", 429),
-                scope,
-                global_header,
-                wait_seconds,
-                source,
-                DISCORD_LOGIN_RETRY_COUNT,
-            )
+                # Do NOT close bot.http here. Discord explicitly tells clients
+                # to wait for Retry-After/retry_after before making another
+                # request; the existing aiohttp session can remain open.
+                await _reset_discord_client_state_after_login_error("http-429")
+                await asyncio.sleep(wait_seconds)
 
-            await _close_discord_http_session_after_login_error()
-            await asyncio.sleep(wait_seconds)
+                DISCORD_LOGIN_STATE = "retrying"
+                DISCORD_LOGIN_RETRY_AFTER = 0.0
+                continue
 
-            DISCORD_LOGIN_STATE = "retrying"
-            DISCORD_LOGIN_RETRY_AFTER = 0.0
+            if isinstance(exc, RuntimeError) and "Session is closed" in str(exc):
+                DISCORD_LOGIN_SESSION_RECOVERY_COUNT += 1
+                DISCORD_LOGIN_STATE = "session_recovery_waiting"
+                wait_seconds = min(session_recovery_backoff, 300.0)
+                DISCORD_LOGIN_RETRY_AFTER = wait_seconds
+                log.warning(
+                    "Discord login encountered closed HTTP session | recovery_count=%d | waiting=%.1fs | keeping service alive",
+                    DISCORD_LOGIN_SESSION_RECOVERY_COUNT,
+                    wait_seconds,
+                )
+                await _reset_discord_client_state_after_login_error("closed-session")
+                await asyncio.sleep(wait_seconds)
+                session_recovery_backoff = min(session_recovery_backoff * 2.0, 300.0)
+                DISCORD_LOGIN_STATE = "retrying"
+                DISCORD_LOGIN_RETRY_AFTER = 0.0
+                continue
+
+            DISCORD_LOGIN_STATE = "failed"
+            raise
 
 
 async def main():
