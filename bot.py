@@ -12,6 +12,7 @@ import signal
 from pathlib import Path
 from types import MethodType
 
+import aiohttp
 from aiohttp import web
 import discord
 from discord.ext import commands
@@ -20,7 +21,7 @@ from discord import app_commands
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.26")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.27")
 
 # Translation-room configuration. JAVIS translates messages ONLY in channels
 # explicitly enabled with /setroom. The configuration is per Discord guild.
@@ -1195,7 +1196,7 @@ async def _refresh_outbound_ip() -> None:
     last_error = ""
     for url in providers:
         try:
-            async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "JAVIS/1.0.26"}) as session:
+            async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "JAVIS/1.0.27"}) as session:
                 async with session.get(url) as response:
                     if response.status != 200:
                         last_error = f"{url} -> HTTP {response.status}"
