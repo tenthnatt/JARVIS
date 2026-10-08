@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import gc
 import json
 import logging
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import signal
 from pathlib import Path
+from types import MethodType
 
 from aiohttp import web
 import discord
@@ -18,7 +20,7 @@ from discord import app_commands
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.25")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.26")
 
 # Translation-room configuration. JAVIS translates messages ONLY in channels
 # explicitly enabled with /setroom. The configuration is per Discord guild.
@@ -798,6 +800,29 @@ DISCORD_OUTBOUND_LAST_429_RETRY_AFTER = 0.0
 DISCORD_OUTBOUND_LAST_429_CONTEXT = ""
 DISCORD_OUTBOUND_LAST_CF_RAY = ""
 
+# Discord request telemetry / Render egress identity.
+# Diagnostic metadata only; this does not change Discord request behavior.
+DISCORD_HTTP_ATTEMPT = 0
+DISCORD_INVALID_REQUEST_COUNT = 0
+DISCORD_LAST_REQUEST_STATUS_CODE: int | str = "-"
+DISCORD_LAST_REQUEST_429_SCOPE = "-"
+DISCORD_LAST_REQUEST_RETRY_AFTER = 0.0
+DISCORD_LAST_REQUEST_CF_RAY = "-"
+DISCORD_LAST_REQUEST_CONTEXT = "-"
+DISCORD_LAST_REQUEST_ROUTE = "-"
+DISCORD_REQUEST_CONTEXT = contextvars.ContextVar("javis_discord_request_context", default="")
+
+RENDER_SERVICE = (os.getenv("RENDER_SERVICE", "").strip() or os.getenv("RENDER_SERVICE_NAME", "").strip() or os.getenv("RENDER_SERVICE_ID", "").strip())
+if not RENDER_SERVICE:
+    external_hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME", "").strip()
+    RENDER_SERVICE = external_hostname.split(".", 1)[0] if external_hostname else "-"
+RENDER_REGION = os.getenv("RENDER_REGION", "").strip() or os.getenv("RENDER_SERVICE_REGION", "").strip() or "-"
+OUTBOUND_IP = os.getenv("OUTBOUND_IP_OVERRIDE", "").strip() or "-"
+OUTBOUND_IP_LAST_CHECK_AT = 0.0
+OUTBOUND_IP_LAST_ERROR = ""
+OUTBOUND_IP_REFRESH_INTERVAL_SECONDS = max(900.0, float(os.getenv("OUTBOUND_IP_REFRESH_INTERVAL", "1800")))
+OUTBOUND_IP_REFRESH_TASK: asyncio.Task | None = None
+
 
 def _preserve_whitespace(fragment: str) -> tuple[str, str, str]:
     left = fragment[: len(fragment) - len(fragment.lstrip())]
@@ -983,6 +1008,34 @@ async def health(request: web.Request) -> web.Response:
             "discord_outbound_last_429_retry_after": DISCORD_OUTBOUND_LAST_429_RETRY_AFTER,
             "discord_outbound_last_429_context": DISCORD_OUTBOUND_LAST_429_CONTEXT,
             "discord_outbound_last_429_cf_ray": DISCORD_OUTBOUND_LAST_CF_RAY,
+            "render_service": RENDER_SERVICE,
+            "render_region": RENDER_REGION,
+            "outbound_ip": OUTBOUND_IP,
+            "outbound_ip_last_check_at": OUTBOUND_IP_LAST_CHECK_AT,
+            "outbound_ip_last_error": OUTBOUND_IP_LAST_ERROR,
+            "discord_http_attempt": DISCORD_HTTP_ATTEMPT,
+            "discord_invalid_request_count": DISCORD_INVALID_REQUEST_COUNT,
+            "discord_last_request_status_code": DISCORD_LAST_REQUEST_STATUS_CODE,
+            "discord_last_request_429_scope": DISCORD_LAST_REQUEST_429_SCOPE,
+            "discord_last_request_retry_after": DISCORD_LAST_REQUEST_RETRY_AFTER,
+            "discord_last_request_cf_ray": DISCORD_LAST_REQUEST_CF_RAY,
+            "discord_last_request_context": DISCORD_LAST_REQUEST_CONTEXT,
+            "discord_last_request_route": DISCORD_LAST_REQUEST_ROUTE,
+            "discord_request_telemetry": {
+                "BOT_NAME": (os.getenv("BOT_NAME", "JARVIS").strip() or "JARVIS"),
+                "BOT_USER_ID": str(getattr(getattr(bot, "user", None), "id", "") or "-"),
+                "APPLICATION_ID": str(getattr(bot, "application_id", None) or os.getenv("DISCORD_APPLICATION_ID", "-") or "-"),
+                "RENDER_SERVICE": RENDER_SERVICE,
+                "RENDER_REGION": RENDER_REGION,
+                "OUTBOUND_IP": OUTBOUND_IP,
+                "DISCORD_HTTP_ATTEMPT": DISCORD_HTTP_ATTEMPT,
+                "STATUS_CODE": DISCORD_LAST_REQUEST_STATUS_CODE,
+                "429_SCOPE": DISCORD_LAST_REQUEST_429_SCOPE,
+                "RETRY_AFTER": DISCORD_LAST_REQUEST_RETRY_AFTER,
+                "CF-RAY": DISCORD_LAST_REQUEST_CF_RAY,
+                "INVALID_REQUEST_COUNT": DISCORD_INVALID_REQUEST_COUNT,
+                "REQUEST_CONTEXT": DISCORD_LAST_REQUEST_CONTEXT,
+            },
         },
         status=200 if token_configured and worker_alive else 503,
     )
@@ -1003,6 +1056,182 @@ async def start_http_server() -> web.AppRunner:
     return runner
 
 
+def _safe_bot_name() -> str:
+    user = getattr(bot, "user", None)
+    return str(getattr(user, "name", "") or os.getenv("BOT_NAME", "JARVIS") or "JARVIS")
+
+
+def _safe_bot_user_id() -> str:
+    user = getattr(bot, "user", None)
+    return str(getattr(user, "id", "") or "-")
+
+
+def _safe_application_id() -> str:
+    application_id = getattr(bot, "application_id", None)
+    if application_id:
+        return str(application_id)
+    return os.getenv("DISCORD_APPLICATION_ID", "").strip() or "-"
+
+
+def _sanitize_discord_route(route: object) -> str:
+    method = str(getattr(route, "method", "?") or "?")
+    path = str(getattr(route, "path", "") or "")
+    if not path:
+        path = str(getattr(route, "url", "") or route)
+    path = re.sub(r"(/webhooks/[^/]+/)[^/?]+", r"\1[redacted]", path)
+    path = re.sub(r"(/interactions/[^/]+/)[^/?]+", r"\1[redacted]", path)
+    return f"{method} {path}"[:500]
+
+
+def _extract_discord_error_metadata(exc: Exception) -> tuple[int | str, str, float, str]:
+    status = getattr(exc, "status", None)
+    try:
+        status_value: int | str = int(status) if status is not None else "-"
+    except (TypeError, ValueError):
+        status_value = str(status or "-")
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    scope = "-"
+    if status_value == 429:
+        try:
+            scope = str(headers.get("X-RateLimit-Scope") or headers.get("x-ratelimit-scope") or "unknown")
+        except Exception:
+            scope = "-"
+    retry_after = 0.0
+    try:
+        retry_after = float(getattr(exc, "retry_after", 0) or 0)
+    except (TypeError, ValueError):
+        retry_after = 0.0
+    if retry_after <= 0:
+        for key in ("Retry-After", "retry-after", "X-RateLimit-Reset-After", "x-ratelimit-reset-after"):
+            try:
+                raw = headers.get(key)
+            except Exception:
+                raw = None
+            if raw is None:
+                continue
+            try:
+                retry_after = max(0.0, float(raw))
+                break
+            except (TypeError, ValueError):
+                continue
+    try:
+        cf_ray = str(headers.get("CF-Ray") or headers.get("cf-ray") or "-")
+    except Exception:
+        cf_ray = "-"
+    return status_value, scope, retry_after, cf_ray
+
+
+def _record_discord_request_telemetry(*, status_code: int | str, scope: str = "-", retry_after: float = 0.0, cf_ray: str = "-", context: str = "-", route: str = "-") -> None:
+    global DISCORD_INVALID_REQUEST_COUNT
+    global DISCORD_LAST_REQUEST_STATUS_CODE, DISCORD_LAST_REQUEST_429_SCOPE
+    global DISCORD_LAST_REQUEST_RETRY_AFTER, DISCORD_LAST_REQUEST_CF_RAY
+    global DISCORD_LAST_REQUEST_CONTEXT, DISCORD_LAST_REQUEST_ROUTE
+
+    normalized_scope = str(scope or "-")
+    if status_code in {401, 403, 429} and not (status_code == 429 and normalized_scope == "shared"):
+        DISCORD_INVALID_REQUEST_COUNT += 1
+
+    DISCORD_LAST_REQUEST_STATUS_CODE = status_code
+    DISCORD_LAST_REQUEST_429_SCOPE = normalized_scope if status_code == 429 else "-"
+    DISCORD_LAST_REQUEST_RETRY_AFTER = max(0.0, float(retry_after or 0.0))
+    DISCORD_LAST_REQUEST_CF_RAY = str(cf_ray or "-")
+    DISCORD_LAST_REQUEST_CONTEXT = str(context or "-")[:500]
+    DISCORD_LAST_REQUEST_ROUTE = str(route or "-")[:500]
+
+    log.info(
+        "Discord request telemetry | BOT_NAME=%s | BOT_USER_ID=%s | APPLICATION_ID=%s | RENDER_SERVICE=%s | RENDER_REGION=%s | OUTBOUND_IP=%s | DISCORD_HTTP_ATTEMPT=%d | STATUS_CODE=%s | 429_SCOPE=%s | RETRY_AFTER=%.3f | CF-RAY=%s | INVALID_REQUEST_COUNT=%d | REQUEST_CONTEXT=%s | ROUTE=%s",
+        _safe_bot_name(), _safe_bot_user_id(), _safe_application_id(), RENDER_SERVICE, RENDER_REGION,
+        OUTBOUND_IP, DISCORD_HTTP_ATTEMPT, status_code, normalized_scope, max(0.0, float(retry_after or 0.0)),
+        cf_ray or "-", DISCORD_INVALID_REQUEST_COUNT, str(context or "-")[:500], str(route or "-")[:500],
+    )
+
+
+async def _telemetry_wrapped_discord_http_request(original_request, route, *args, **kwargs):
+    global DISCORD_HTTP_ATTEMPT
+    DISCORD_HTTP_ATTEMPT += 1
+    route_text = _sanitize_discord_route(route)
+    context = DISCORD_REQUEST_CONTEXT.get() or f"discord-api:{route_text}"
+    try:
+        result = await original_request(route, *args, **kwargs)
+        _record_discord_request_telemetry(status_code="2xx", context=context, route=route_text)
+        return result
+    except discord.HTTPException as exc:
+        status_code, scope, retry_after, cf_ray = _extract_discord_error_metadata(exc)
+        _record_discord_request_telemetry(status_code=status_code, scope=scope, retry_after=retry_after, cf_ray=cf_ray, context=context, route=route_text)
+        raise
+    except Exception:
+        _record_discord_request_telemetry(status_code="transport-error", context=context, route=route_text)
+        raise
+
+
+def _install_discord_http_telemetry() -> None:
+    http_client = getattr(bot, "http", None)
+    if http_client is None or getattr(http_client, "_javis_telemetry_wrapped", False):
+        return
+    original_request = http_client.request
+
+    async def _wrapped(self, route, *args, **kwargs):
+        return await _telemetry_wrapped_discord_http_request(original_request, route, *args, **kwargs)
+
+    http_client.request = MethodType(_wrapped, http_client)
+    http_client._javis_telemetry_wrapped = True
+    http_client._javis_telemetry_original_request = original_request
+    log.info("Discord HTTP telemetry installed | client=%s", type(http_client).__name__)
+
+
+async def _refresh_outbound_ip() -> None:
+    global OUTBOUND_IP, OUTBOUND_IP_LAST_CHECK_AT, OUTBOUND_IP_LAST_ERROR
+    override = os.getenv("OUTBOUND_IP_OVERRIDE", "").strip()
+    if override:
+        OUTBOUND_IP = override
+        OUTBOUND_IP_LAST_CHECK_AT = time.time()
+        OUTBOUND_IP_LAST_ERROR = ""
+        log.info("Render outbound IP override configured | OUTBOUND_IP=%s", OUTBOUND_IP)
+        return
+
+    timeout = aiohttp.ClientTimeout(total=8)
+    providers = ("https://api.ipify.org?format=json", "https://ifconfig.me/ip")
+    last_error = ""
+    for url in providers:
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "JAVIS/1.0.26"}) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        last_error = f"{url} -> HTTP {response.status}"
+                        continue
+                    if "ipify" in url:
+                        data = await response.json(content_type=None)
+                        ip_value = str(data.get("ip") or "").strip() if isinstance(data, dict) else ""
+                    else:
+                        ip_value = (await response.text()).strip()
+                    if ip_value and len(ip_value) <= 64:
+                        OUTBOUND_IP = ip_value
+                        OUTBOUND_IP_LAST_CHECK_AT = time.time()
+                        OUTBOUND_IP_LAST_ERROR = ""
+                        log.info("Render outbound IP detected | OUTBOUND_IP=%s | provider=%s | RENDER_SERVICE=%s | RENDER_REGION=%s", OUTBOUND_IP, url, RENDER_SERVICE, RENDER_REGION)
+                        return
+                    last_error = f"{url} -> empty IP response"
+        except Exception as exc:
+            last_error = f"{url} -> {type(exc).__name__}: {exc}"
+    OUTBOUND_IP_LAST_CHECK_AT = time.time()
+    OUTBOUND_IP_LAST_ERROR = last_error[:500]
+    log.warning("Render outbound IP detection failed safely | error=%s", OUTBOUND_IP_LAST_ERROR)
+
+
+async def _outbound_ip_refresh_worker() -> None:
+    while not DISCORD_SHUTDOWN_EVENT.is_set():
+        try:
+            await asyncio.wait_for(DISCORD_SHUTDOWN_EVENT.wait(), timeout=OUTBOUND_IP_REFRESH_INTERVAL_SECONDS)
+            break
+        except asyncio.TimeoutError:
+            await _refresh_outbound_ip()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Outbound IP refresh worker failed safely | %r", exc)
+
+
 def get_discord_token() -> str:
     return (
         os.getenv("DISCORD_TOKEN", "").strip()
@@ -1015,6 +1244,7 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!javis ", intents=intents, help_command=None)
 ALLOWED_MENTIONS = discord.AllowedMentions.none()
+_install_discord_http_telemetry()
 
 
 @bot.event
@@ -1430,10 +1660,14 @@ async def send_safe_translation(message: discord.Message, content: str) -> disco
         return None
     try:
         log.info("Discord send start | channel=%s | chars=%d", getattr(message.channel, "id", "?"), len(content))
-        sent = await asyncio.wait_for(
-            message.channel.send(content, allowed_mentions=ALLOWED_MENTIONS),
-            timeout=20,
-        )
+        _ctx_token = DISCORD_REQUEST_CONTEXT.set("translation:channel-send")
+        try:
+            sent = await asyncio.wait_for(
+                message.channel.send(content, allowed_mentions=ALLOWED_MENTIONS),
+                timeout=20,
+            )
+        finally:
+            DISCORD_REQUEST_CONTEXT.reset(_ctx_token)
         log.info("Discord send complete | channel=%s | chars=%d", getattr(message.channel, "id", "?"), len(content))
         return sent
     except asyncio.TimeoutError:
@@ -1461,10 +1695,14 @@ async def edit_safe_translation(sent_message: discord.Message, content: str) -> 
         )
         return False
     try:
-        await asyncio.wait_for(
-            sent_message.edit(content=content, allowed_mentions=ALLOWED_MENTIONS),
-            timeout=20,
-        )
+        _ctx_token = DISCORD_REQUEST_CONTEXT.set("translation:message-edit")
+        try:
+            await asyncio.wait_for(
+                sent_message.edit(content=content, allowed_mentions=ALLOWED_MENTIONS),
+                timeout=20,
+            )
+        finally:
+            DISCORD_REQUEST_CONTEXT.reset(_ctx_token)
         return True
     except asyncio.TimeoutError:
         log.warning("Discord translation edit timed out safely; no fallback HTTP request will be sent")
@@ -1487,13 +1725,17 @@ async def safe_context_reply(ctx: commands.Context, content: str, **kwargs) -> b
         log.warning("Discord command reply skipped during outbound cooldown | no HTTP sent")
         return False
     try:
-        await asyncio.wait_for(
-            ctx.reply(
-                content,
-                **kwargs,
-            ),
-            timeout=20,
-        )
+        _ctx_token = DISCORD_REQUEST_CONTEXT.set("command:reply")
+        try:
+            await asyncio.wait_for(
+                ctx.reply(
+                    content,
+                    **kwargs,
+                ),
+                timeout=20,
+            )
+        finally:
+            DISCORD_REQUEST_CONTEXT.reset(_ctx_token)
         return True
     except asyncio.TimeoutError:
         log.warning("Discord command reply timed out safely; no retry HTTP request will be sent")
@@ -1742,6 +1984,7 @@ async def _rebuild_discord_http_client(reason: str) -> None:
             new_http = HTTPClient(loop, None, proxy=proxy, proxy_auth=proxy_auth)
         bot.http = new_http
         DISCORD_LOGIN_HTTP_REBUILD_COUNT += 1
+        _install_discord_http_telemetry()
         log.info(
             "Discord HTTP client object rebuilt | rebuild_count=%d | reason=%s | fresh_session=deferred_until_login",
             DISCORD_LOGIN_HTTP_REBUILD_COUNT,
@@ -1987,6 +2230,12 @@ async def main():
     ARGOS_WORKER.start()
     runner = await start_http_server()
     _install_discord_shutdown_signal_handlers()
+    await _refresh_outbound_ip()
+    global OUTBOUND_IP_REFRESH_TASK
+    OUTBOUND_IP_REFRESH_TASK = asyncio.create_task(
+        _outbound_ip_refresh_worker(),
+        name="javis-outbound-ip-refresh",
+    )
     discord_task = asyncio.create_task(
         _start_discord_with_rate_limit_retry(discord_token),
         name="javis-discord-startup",
@@ -2013,6 +2262,9 @@ async def main():
         if not shutdown_task.done():
             shutdown_task.cancel()
         await asyncio.gather(shutdown_task, return_exceptions=True)
+        if OUTBOUND_IP_REFRESH_TASK is not None and not OUTBOUND_IP_REFRESH_TASK.done():
+            OUTBOUND_IP_REFRESH_TASK.cancel()
+            await asyncio.gather(OUTBOUND_IP_REFRESH_TASK, return_exceptions=True)
         await runner.cleanup()
         if ARGOS_WORKER is not None:
             ARGOS_WORKER.shutdown()

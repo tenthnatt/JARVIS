@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>JAVIS — TWOM Translator v1.0.25</title>
+  <title>JAVIS — TWOM Translator v1.0.26</title>
   <style>
     :root { color-scheme: dark; }
     body { margin:0; font-family:system-ui,-apple-system,Segoe UI,sans-serif; background:#0f1115; color:#f3f4f6; }
@@ -28,7 +28,7 @@
   <h1>JAVIS — TWOM Auto Translator</h1>
   <p id="message">กำลังตรวจสอบสถานะบริการ...</p>
   <div class="grid">
-    <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.25</div></div>
+    <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.26</div></div>
     <div class="item"><div class="label">Languages</div><div class="value">TH → EN + KO<br>EN → TH + KO<br>KO → EN + TH</div></div>
     <div class="item"><div class="label">Engine</div><div class="value">Argos + CTranslate2</div></div>
     <div class="item"><div class="label">Runtime Quantization</div><div id="compute" class="value">Checking...</div></div>
@@ -51,6 +51,19 @@
     <div class="item"><div class="label">Last 429 Scope</div><div id="lastscope" class="value">Checking...</div></div>
     <div class="item"><div class="label">Last 429 Global</div><div id="lastglobal" class="value">Checking...</div></div>
     <div class="item"><div class="label">Last 429 CF-Ray</div><div id="lastcfray" class="value small">Checking...</div></div>
+    <div class="item"><div class="label">BOT_NAME</div><div id="botname" class="value">Checking...</div></div>
+    <div class="item"><div class="label">BOT_USER_ID</div><div id="botuserid" class="value small">Checking...</div></div>
+    <div class="item"><div class="label">APPLICATION_ID</div><div id="appid" class="value small">Checking...</div></div>
+    <div class="item"><div class="label">RENDER_SERVICE</div><div id="renderService" class="value">Checking...</div></div>
+    <div class="item"><div class="label">RENDER_REGION</div><div id="renderRegion" class="value">Checking...</div></div>
+    <div class="item"><div class="label">OUTBOUND_IP</div><div id="outboundIp" class="value">Checking...</div></div>
+    <div class="item"><div class="label">DISCORD_HTTP_ATTEMPT</div><div id="httpAttempt" class="value">Checking...</div></div>
+    <div class="item"><div class="label">STATUS_CODE</div><div id="statusCode" class="value">Checking...</div></div>
+    <div class="item"><div class="label">429_SCOPE</div><div id="scope429" class="value">Checking...</div></div>
+    <div class="item"><div class="label">RETRY_AFTER</div><div id="retryTelemetry" class="value">Checking...</div></div>
+    <div class="item"><div class="label">CF-RAY</div><div id="cfRayTelemetry" class="value small">Checking...</div></div>
+    <div class="item"><div class="label">INVALID_REQUEST_COUNT</div><div id="invalidCount" class="value">Checking...</div></div>
+    <div class="item"><div class="label">REQUEST_CONTEXT</div><div id="requestContext" class="value small">Checking...</div></div>
     <div class="item"><div class="label">Discord Token</div><div id="token" class="value">Checking...</div></div>
     <div class="item"><div class="label">Mode</div><div class="value">Text-only · Auto Translate</div></div>
     <div class="item"><div class="label">Argos Packages</div><div id="packages" class="value small">Checking...</div></div>
@@ -65,6 +78,7 @@
     <div class="item"><div class="label">Decode</div><div id="decode" class="value">Checking...</div></div>
     <div class="item"><div class="label">Response</div><div id="responsemode" class="value">Checking...</div></div>
     <div class="item"><div class="label">Runtime Settings</div><div class="value small">ARGOS_COMPUTE_TYPE=int8 · CPU · Batch=1 enforced</div></div>
+    <div class="item"><div class="label">Discord Telemetry</div><div class="value small">Request metadata only · token/body never logged · 429 shared is excluded from INVALID_REQUEST_COUNT</div></div>
   </div>
 </section>
 </main>
@@ -102,6 +116,20 @@ async function refreshStatus() {
     document.getElementById('lastscope').textContent=d.discord_login_last_scope || 'unknown';
     document.getElementById('lastglobal').textContent=d.discord_login_last_global ? 'true' : 'false';
     document.getElementById('lastcfray').textContent=d.discord_login_last_cf_ray || '-';
+    const t=d.discord_request_telemetry || {};
+    document.getElementById('botname').textContent=t.BOT_NAME || '-';
+    document.getElementById('botuserid').textContent=t.BOT_USER_ID || '-';
+    document.getElementById('appid').textContent=t.APPLICATION_ID || '-';
+    document.getElementById('renderService').textContent=t.RENDER_SERVICE || d.render_service || '-';
+    document.getElementById('renderRegion').textContent=t.RENDER_REGION || d.render_region || '-';
+    document.getElementById('outboundIp').textContent=t.OUTBOUND_IP || d.outbound_ip || '-';
+    document.getElementById('httpAttempt').textContent=t.DISCORD_HTTP_ATTEMPT ?? d.discord_http_attempt ?? 0;
+    document.getElementById('statusCode').textContent=t.STATUS_CODE ?? d.discord_last_request_status_code ?? '-';
+    document.getElementById('scope429').textContent=t['429_SCOPE'] || d.discord_last_request_429_scope || '-';
+    document.getElementById('retryTelemetry').textContent=`${Number(t.RETRY_AFTER ?? d.discord_last_request_retry_after ?? 0).toFixed(3)}s`;
+    document.getElementById('cfRayTelemetry').textContent=t['CF-RAY'] || d.discord_last_request_cf_ray || '-';
+    document.getElementById('invalidCount').textContent=t.INVALID_REQUEST_COUNT ?? d.discord_invalid_request_count ?? 0;
+    document.getElementById('requestContext').textContent=t.REQUEST_CONTEXT || d.discord_last_request_context || '-';
     if(d.ok && d.translation_worker_alive && d.discord_ready){
       badge.textContent='● JAVIS ONLINE'; badge.className='ok';
       message.textContent=`Discord + Translation worker are running. Use /setroom to choose translation rooms, /delroom to remove them, and /roomlist to review them.`;
