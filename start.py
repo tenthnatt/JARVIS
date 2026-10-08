@@ -7,7 +7,7 @@ needs those settings. The Discord bot itself remains in bot.py.
 import asyncio
 import os
 
-JAVIS_VERSION = "1.0.29"
+JAVIS_VERSION = "1.0.30"
 os.environ["JAVIS_VERSION"] = JAVIS_VERSION
 
 # Render zero-downtime deploy protection: Render starts a new instance before

@@ -22,16 +22,21 @@ from discord import app_commands
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.29")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.30")
 
 # Translation-room configuration. JAVIS translates messages ONLY in channels
 # explicitly enabled with /setroom. The configuration is per Discord guild.
 TRANSLATION_ROOMS_PATH = BASE_DIR / "translation_rooms.json"
+# Render Free uses an ephemeral filesystem, so the local JSON file is only a cache.
+# The marker below is stored invisibly in each configured Discord text-channel topic
+# so /setroom survives redeploys/restarts without requiring a paid persistent disk.
+TRANSLATION_ROOM_TOPIC_MARKER = "\u2063JAVIS_TRANSLATION_ROOM_V1\u2063"
 TRANSLATION_ROOMS: dict[str, set[int]] = {}
 TRANSLATION_ROOMS_IO_LOCK = asyncio.Lock()
 TRANSLATION_ROOM_COMMAND_SYNC_STARTED = False
 TRANSLATION_ROOM_COMMAND_SYNC_STATE = "pending"
 TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = 0.0
+TRANSLATION_ROOM_PERSISTENCE_STATE = "local_cache_only"
 
 PORT = int(os.getenv("PORT", "10000"))
 MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "1200"))
@@ -149,6 +154,128 @@ def _is_translation_room_enabled(guild_id: int, channel_id: int) -> bool:
 
 def _translation_room_count() -> int:
     return sum(len(channel_ids) for channel_ids in TRANSLATION_ROOMS.values())
+
+
+def _topic_has_translation_room_marker(topic: str | None) -> bool:
+    return bool(topic and TRANSLATION_ROOM_TOPIC_MARKER in topic)
+
+
+def _topic_add_translation_room_marker(topic: str | None) -> str | None:
+    current = topic or ""
+    if _topic_has_translation_room_marker(current):
+        return current
+    candidate = current + TRANSLATION_ROOM_TOPIC_MARKER
+    if len(candidate) > 1024:
+        return None
+    return candidate
+
+
+def _topic_remove_translation_room_marker(topic: str | None) -> str:
+    current = topic or ""
+    if TRANSLATION_ROOM_TOPIC_MARKER not in current:
+        return current
+    return current.replace(TRANSLATION_ROOM_TOPIC_MARKER, "")
+
+
+async def _persist_translation_room_marker(channel: discord.TextChannel, *, enabled: bool) -> bool:
+    """Persist room selection in the Discord channel topic so it survives Render deploys."""
+    global TRANSLATION_ROOM_PERSISTENCE_STATE
+    current_topic = channel.topic or ""
+    new_topic = (
+        _topic_add_translation_room_marker(current_topic)
+        if enabled
+        else _topic_remove_translation_room_marker(current_topic)
+    )
+    if new_topic is None:
+        TRANSLATION_ROOM_PERSISTENCE_STATE = "topic_too_long"
+        log.warning(
+            "Translation room persistence marker skipped | channel=%s | reason=topic_limit",
+            channel.id,
+        )
+        return False
+    if new_topic == current_topic:
+        TRANSLATION_ROOM_PERSISTENCE_STATE = "discord_channel_topic"
+        return True
+    if _discord_http_quarantined() or _discord_outbound_block_remaining() > 0:
+        TRANSLATION_ROOM_PERSISTENCE_STATE = "discord_quarantined"
+        log.warning(
+            "Translation room persistence marker skipped during Discord quarantine/cooldown | channel=%s | no HTTP sent",
+            channel.id,
+        )
+        return False
+    try:
+        await channel.edit(
+            topic=new_topic or None,
+            reason="JAVIS translation-room persistence marker",
+        )
+        TRANSLATION_ROOM_PERSISTENCE_STATE = "discord_channel_topic"
+        log.info(
+            "Translation room persistence marker updated | channel=%s | enabled=%s",
+            channel.id,
+            enabled,
+        )
+        return True
+    except discord.HTTPException as exc:
+        if getattr(exc, "status", None) == 429:
+            try:
+                _record_discord_outbound_429(exc, context="translation-room:persistence-marker")
+            except Exception:
+                pass
+        TRANSLATION_ROOM_PERSISTENCE_STATE = "marker_update_failed"
+        log.warning(
+            "Translation room persistence marker update failed safely | channel=%s | status=%s | %r",
+            channel.id,
+            getattr(exc, "status", None),
+            exc,
+        )
+        return False
+    except discord.Forbidden:
+        TRANSLATION_ROOM_PERSISTENCE_STATE = "bot_missing_manage_channels"
+        log.warning(
+            "Translation room persistence marker unavailable | channel=%s | bot needs Manage Channels to persist /setroom across deploys",
+            channel.id,
+        )
+        return False
+    except Exception as exc:
+        TRANSLATION_ROOM_PERSISTENCE_STATE = "marker_update_failed"
+        log.warning(
+            "Translation room persistence marker update failed safely | channel=%s | %r",
+            channel.id,
+            exc,
+        )
+        return False
+
+
+async def _recover_translation_rooms_from_discord() -> None:
+    """Recover /setroom state from invisible channel-topic markers after redeploy."""
+    global TRANSLATION_ROOM_PERSISTENCE_STATE
+    recovered: dict[str, set[int]] = {}
+    for guild in bot.guilds:
+        for channel in guild.text_channels:
+            if _topic_has_translation_room_marker(channel.topic):
+                recovered.setdefault(str(guild.id), set()).add(channel.id)
+
+    async with TRANSLATION_ROOMS_IO_LOCK:
+        if recovered:
+            for guild_id, channel_ids in recovered.items():
+                TRANSLATION_ROOMS[guild_id] = set(channel_ids)
+            await asyncio.to_thread(_save_translation_rooms_sync)
+            TRANSLATION_ROOM_PERSISTENCE_STATE = "discord_channel_topic"
+            log.info(
+                "Translation rooms recovered from Discord channel topics | guilds=%d | rooms=%d",
+                len(recovered),
+                sum(len(v) for v in recovered.values()),
+            )
+        elif TRANSLATION_ROOMS:
+            # Keep the local cache as a compatibility fallback. It is not persistent
+            # across Render Free deploys, but it remains useful within the same process.
+            TRANSLATION_ROOM_PERSISTENCE_STATE = "local_cache_only"
+            log.info(
+                "No Discord translation-room markers found | using local cache | rooms=%d",
+                _translation_room_count(),
+            )
+        else:
+            TRANSLATION_ROOM_PERSISTENCE_STATE = "empty"
 
 
 _load_translation_rooms_sync()
@@ -989,6 +1116,7 @@ async def health(request: web.Request) -> web.Response:
             "korean_engine": os.getenv("ARGOS_KO_ENGINE", "argos-native"),
             "korean_beam_size": int(os.getenv("ARGOS_KO_BEAM_SIZE", "4")),
             "translation_worker_alive": worker_alive,
+            "translation_room_persistence_state": TRANSLATION_ROOM_PERSISTENCE_STATE,
             "translation_runner_mode": "ct2-direct-argos-compatible-v1.0.20-per-target",
             "discord_session_recovery_mode": "fresh-httpclient-object-after-login-transport-failure",
             "quality_mode": "argos-compatible-decode-pieces+raw-target-prefix+pivot-fix+twom-span-glossary",
@@ -1275,6 +1403,7 @@ async def on_ready():
         JAVIS_VERSION,
     )
     await bot.change_presence(activity=discord.Game(name="TH ↔ EN ↔ KO | TWOM"))
+    await _recover_translation_rooms_from_discord()
     _ensure_translation_room_command_sync_task()
 
 
@@ -1332,34 +1461,47 @@ async def reload_command(ctx: commands.Context):
 
 
 async def _sync_translation_room_commands_once() -> None:
-    """Register room-management slash commands once, respecting Discord 429s."""
+    """Register room-management slash commands once and remove stale global duplicates."""
     global TRANSLATION_ROOM_COMMAND_SYNC_STATE, TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER
     configured_guild_id = os.getenv("DISCORD_GUILD_ID", "").strip()
-
-    async def _do_sync() -> int:
-        if configured_guild_id.isdigit() and int(configured_guild_id) > 0:
-            guild = discord.Object(id=int(configured_guild_id))
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            TRANSLATION_ROOM_COMMAND_SYNC_STATE = "synced_guild"
-        else:
-            synced = await bot.tree.sync()
-            TRANSLATION_ROOM_COMMAND_SYNC_STATE = "synced_global"
-        TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = 0.0
-        return len(synced)
 
     if _discord_http_quarantined():
         TRANSLATION_ROOM_COMMAND_SYNC_STATE = "quarantined"
         log.warning("Translation room slash-command sync skipped during Discord 429 quarantine | no HTTP sent")
         return
 
+    async def _do_sync() -> int:
+        if configured_guild_id.isdigit() and int(configured_guild_id) > 0:
+            guild = discord.Object(id=int(configured_guild_id))
+            # The decorators define these commands globally in the local tree. Copy
+            # exactly those commands to the target guild, then remove the global
+            # copies remotely so Discord shows each command only once in the guild.
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+
+            # Remove only JAVIS's three room-management commands from the global
+            # scope. This preserves any unrelated global application commands that
+            # might exist on the same Discord application. The following global sync
+            # deletes the stale global copies that caused each command to appear twice
+            # when the guild-scoped copies were added.
+            for command_name in ("setroom", "delroom", "roomlist"):
+                bot.tree.remove_command(command_name, guild=None, type=discord.AppCommandType.chat_input)
+            await bot.tree.sync()
+            TRANSLATION_ROOM_COMMAND_SYNC_STATE = "synced_guild_global_javis_commands_cleared"
+            return len(synced)
+        synced = await bot.tree.sync()
+        TRANSLATION_ROOM_COMMAND_SYNC_STATE = "synced_global"
+        return len(synced)
+
     try:
         count = await _do_sync()
         log.info(
-            "Translation room slash commands synced | commands=%d | scope=%s",
+            "Translation room slash commands synced | commands=%d | scope=%s | global_duplicates_cleared=%s",
             count,
             "guild" if configured_guild_id.isdigit() and int(configured_guild_id) > 0 else "global",
+            "yes" if configured_guild_id.isdigit() and int(configured_guild_id) > 0 else "no",
         )
+        TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = 0.0
         return
     except discord.HTTPException as exc:
         if getattr(exc, "status", None) != 429:
@@ -1460,6 +1602,10 @@ async def setroom_command(interaction: discord.Interaction, channel: discord.Tex
         if not already_enabled:
             await asyncio.to_thread(_save_translation_rooms_sync)
 
+    # Always reconcile the persistent Discord marker. This also upgrades an older
+    # local-only /setroom entry so the current room survives the next redeploy.
+    await _persist_translation_room_marker(channel, enabled=True)
+
     text = (
         f"ℹ️ ห้อง {channel.mention} เปิดการแปลของ JAVIS อยู่แล้ว"
         if already_enabled
@@ -1497,6 +1643,9 @@ async def delroom_command(interaction: discord.Interaction, channel: discord.Tex
             else:
                 TRANSLATION_ROOMS.pop(guild_key, None)
             await asyncio.to_thread(_save_translation_rooms_sync)
+
+    if removed:
+        await _persist_translation_room_marker(channel, enabled=False)
 
     text = (
         f"✅ ลบห้อง {channel.mention} ออกจากรายการแปลแล้ว"
