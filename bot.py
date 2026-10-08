@@ -21,7 +21,7 @@ from discord import app_commands
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.27")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.28")
 
 # Translation-room configuration. JAVIS translates messages ONLY in channels
 # explicitly enabled with /setroom. The configuration is per Discord guild.
@@ -767,13 +767,18 @@ class ArgosWorkerClient:
 
 ARGOS_WORKER: ArgosWorkerClient | None = None
 
-# Discord startup state. A transient Discord HTTP 429 must not crash the
-# Render process; the bot stays alive and retries after Discord's retry window.
+# Discord startup state. A Discord HTTP 429 must not crash the Render process.
+# Once a 429 is observed, the current process enters a hard quarantine: it records
+# Retry-After/telemetry and makes no further Discord HTTP request attempts.
 DISCORD_LOGIN_STATE = "starting"
 DISCORD_LOGIN_RETRY_COUNT = 0
 DISCORD_LOGIN_RETRY_AFTER = 0.0
 DISCORD_LOGIN_SESSION_RECOVERY_COUNT = 0
 DISCORD_LOGIN_HTTP_REBUILD_COUNT = 0
+DISCORD_QUARANTINED = False
+DISCORD_QUARANTINE_CONTEXT = ""
+DISCORD_QUARANTINE_RETRY_AFTER = 0.0
+DISCORD_QUARANTINE_CF_RAY = ""
 
 # Render zero-downtime deploys start a new instance before SIGTERM-ing the old one.
 # Delay only the FIRST Discord login attempt so the old Gateway has time to hand over.
@@ -794,8 +799,9 @@ DISCORD_LOGIN_LAST_VIA = ""
 DISCORD_LOGIN_LAST_SERVER = ""
 DISCORD_LOGIN_LAST_MESSAGE = ""
 
-# Central outbound Discord HTTP cooldown. Any message/edit HTTP 429 arms this
-# process-local gate until Retry-After so fallback requests do not create more 429s.
+# Central outbound Discord HTTP quarantine/cooldown. Any Discord REST 429 arms
+# the process-local gate using Retry-After and permanently blocks further Discord
+# HTTP attempts for this process, so the same blocked source is never retried.
 DISCORD_OUTBOUND_BLOCKED_UNTIL_MONO = 0.0
 DISCORD_OUTBOUND_LAST_429_RETRY_AFTER = 0.0
 DISCORD_OUTBOUND_LAST_429_CONTEXT = ""
@@ -995,6 +1001,10 @@ async def health(request: web.Request) -> web.Response:
             "discord_login_retry_after": DISCORD_LOGIN_RETRY_AFTER,
             "discord_login_session_recovery_count": DISCORD_LOGIN_SESSION_RECOVERY_COUNT,
             "discord_login_http_rebuild_count": DISCORD_LOGIN_HTTP_REBUILD_COUNT,
+            "discord_quarantined": DISCORD_QUARANTINED,
+            "discord_quarantine_context": DISCORD_QUARANTINE_CONTEXT,
+            "discord_quarantine_retry_after": DISCORD_QUARANTINE_RETRY_AFTER,
+            "discord_quarantine_cf_ray": DISCORD_QUARANTINE_CF_RAY,
             "discord_startup_handover_delay_seconds": DISCORD_STARTUP_HANDOVER_DELAY_SECONDS,
             "discord_shutdown_requested": DISCORD_SHUTDOWN_REQUESTED,
             "discord_login_last_status": DISCORD_LOGIN_LAST_STATUS,
@@ -1333,6 +1343,11 @@ async def _sync_translation_room_commands_once() -> None:
         TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = 0.0
         return len(synced)
 
+    if _discord_http_quarantined():
+        TRANSLATION_ROOM_COMMAND_SYNC_STATE = "quarantined"
+        log.warning("Translation room slash-command sync skipped during Discord 429 quarantine | no HTTP sent")
+        return
+
     try:
         count = await _do_sync()
         log.info(
@@ -1353,52 +1368,16 @@ async def _sync_translation_room_commands_once() -> None:
 
         retry_after, _ = _discord_retry_after_seconds(exc, 60.0)
         TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = retry_after
-        TRANSLATION_ROOM_COMMAND_SYNC_STATE = "rate_limited_waiting"
+        TRANSLATION_ROOM_COMMAND_SYNC_STATE = "quarantined"
         log.warning(
-            "Translation room slash-command sync rate-limited | retry_after=%.1fs | no immediate retry",
+            "Translation room slash-command sync rate-limited | retry_after=%.1fs | quarantining | no retry will be sent",
             retry_after,
         )
         try:
             _record_discord_outbound_429(exc, context="startup:translation-room-command-sync")
         except Exception:
             pass
-        try:
-            await asyncio.wait_for(DISCORD_SHUTDOWN_EVENT.wait(), timeout=retry_after)
-            TRANSLATION_ROOM_COMMAND_SYNC_STATE = "shutdown_requested"
-            TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = 0.0
-            return
-        except asyncio.TimeoutError:
-            pass
-
-        if DISCORD_SHUTDOWN_EVENT.is_set():
-            TRANSLATION_ROOM_COMMAND_SYNC_STATE = "shutdown_requested"
-            TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = 0.0
-            return
-
-        try:
-            count = await _do_sync()
-            TRANSLATION_ROOM_COMMAND_SYNC_STATE = "synced_after_retry"
-            TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = 0.0
-            log.info("Translation room slash commands synced after one delayed retry | commands=%d", count)
-        except discord.HTTPException as retry_exc:
-            if getattr(retry_exc, "status", None) == 429:
-                try:
-                    _record_discord_outbound_429(
-                        retry_exc,
-                        context="startup:translation-room-command-sync-retry",
-                    )
-                except Exception:
-                    pass
-            TRANSLATION_ROOM_COMMAND_SYNC_STATE = "sync_failed"
-            TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = 0.0
-            log.warning(
-                "Translation room slash-command sync retry failed safely | status=%s",
-                getattr(retry_exc, "status", None),
-            )
-        except Exception as retry_exc:
-            TRANSLATION_ROOM_COMMAND_SYNC_STATE = "sync_failed"
-            TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = 0.0
-            log.warning("Translation room slash-command sync retry failed safely | %r", retry_exc)
+        return
     except Exception as exc:
         TRANSLATION_ROOM_COMMAND_SYNC_STATE = "sync_failed"
         TRANSLATION_ROOM_COMMAND_SYNC_RETRY_AFTER = 0.0
@@ -1426,9 +1405,9 @@ async def _safe_interaction_message(
     if interaction.response.is_done():
         return False
     remaining = _discord_outbound_block_remaining()
-    if remaining > 0:
+    if _discord_http_quarantined() or remaining > 0:
         log.warning(
-            "Discord room-management interaction skipped during outbound cooldown | remaining=%.1fs | no HTTP sent",
+            "Discord room-management interaction skipped during outbound quarantine/cooldown | remaining=%.1fs | no HTTP sent",
             remaining,
         )
         return False
@@ -1604,6 +1583,27 @@ def _discord_outbound_block_remaining() -> float:
     return max(0.0, DISCORD_OUTBOUND_BLOCKED_UNTIL_MONO - time.monotonic())
 
 
+def _discord_http_quarantined() -> bool:
+    return bool(DISCORD_QUARANTINED)
+
+
+def _enter_discord_429_quarantine(*, retry_after: float, context: str, cf_ray: str = "") -> None:
+    """Hard-stop further Discord HTTP attempts in this process after a 429."""
+    global DISCORD_QUARANTINED
+    global DISCORD_QUARANTINE_CONTEXT, DISCORD_QUARANTINE_RETRY_AFTER, DISCORD_QUARANTINE_CF_RAY
+
+    DISCORD_QUARANTINED = True
+    DISCORD_QUARANTINE_CONTEXT = str(context or "-")[:500]
+    DISCORD_QUARANTINE_RETRY_AFTER = max(0.0, float(retry_after or 0.0))
+    DISCORD_QUARANTINE_CF_RAY = str(cf_ray or "-")[:200]
+    log.warning(
+        "Discord 429 quarantine engaged | context=%s | retry_after=%.3fs | cf_ray=%s | no further Discord HTTP requests will be attempted by this process",
+        DISCORD_QUARANTINE_CONTEXT,
+        DISCORD_QUARANTINE_RETRY_AFTER,
+        DISCORD_QUARANTINE_CF_RAY or "-",
+    )
+
+
 def _record_discord_outbound_429(exc: Exception, *, context: str) -> float:
     """Arm the outbound cooldown using Discord's Retry-After metadata."""
     global DISCORD_OUTBOUND_BLOCKED_UNTIL_MONO
@@ -1647,15 +1647,20 @@ def _record_discord_outbound_429(exc: Exception, *, context: str) -> float:
         retry_after,
         cf_ray or "-",
     )
+    _enter_discord_429_quarantine(
+        retry_after=retry_after,
+        context=context,
+        cf_ray=cf_ray,
+    )
     return retry_after
 
 
 async def send_safe_translation(message: discord.Message, content: str) -> discord.Message | None:
     """Single-attempt translation send; never retry a failed Discord HTTP call."""
     remaining = _discord_outbound_block_remaining()
-    if remaining > 0:
+    if _discord_http_quarantined() or remaining > 0:
         log.warning(
-            "Discord translation send skipped during outbound cooldown | remaining=%.1fs | no HTTP sent",
+            "Discord translation send skipped during outbound quarantine/cooldown | remaining=%.1fs | no HTTP sent",
             remaining,
         )
         return None
@@ -1689,9 +1694,9 @@ async def send_safe_translation(message: discord.Message, content: str) -> disco
 async def edit_safe_translation(sent_message: discord.Message, content: str) -> bool:
     """Single-attempt progressive edit; a failed HTTP call is never retried."""
     remaining = _discord_outbound_block_remaining()
-    if remaining > 0:
+    if _discord_http_quarantined() or remaining > 0:
         log.warning(
-            "Discord translation edit skipped during outbound cooldown | remaining=%.1fs | no HTTP sent",
+            "Discord translation edit skipped during outbound quarantine/cooldown | remaining=%.1fs | no HTTP sent",
             remaining,
         )
         return False
@@ -1721,9 +1726,9 @@ async def edit_safe_translation(sent_message: discord.Message, content: str) -> 
 
 
 async def safe_context_reply(ctx: commands.Context, content: str, **kwargs) -> bool:
-    """Command reply helper that never retries during a Discord 429 cooldown."""
-    if _discord_outbound_block_remaining() > 0:
-        log.warning("Discord command reply skipped during outbound cooldown | no HTTP sent")
+    """Command reply helper that never retries after a Discord 429 quarantine."""
+    if _discord_http_quarantined() or _discord_outbound_block_remaining() > 0:
+        log.warning("Discord command reply skipped during outbound quarantine/cooldown | no HTTP sent")
         return False
     try:
         _ctx_token = DISCORD_REQUEST_CONTEXT.set("command:reply")
@@ -2084,14 +2089,13 @@ async def _wait_for_discord_startup_handover() -> bool:
 
 
 async def _start_discord_with_rate_limit_retry(discord_token: str) -> None:
-    """Start Discord and survive login 429s without Render restart loops."""
+    """Start Discord; after any HTTP 429, record Retry-After and hard-quarantine this process without retrying."""
     global DISCORD_LOGIN_STATE, DISCORD_LOGIN_RETRY_COUNT, DISCORD_LOGIN_RETRY_AFTER
     global DISCORD_LOGIN_SESSION_RECOVERY_COUNT
     global DISCORD_LOGIN_LAST_STATUS, DISCORD_LOGIN_LAST_SCOPE, DISCORD_LOGIN_LAST_GLOBAL
     global DISCORD_LOGIN_LAST_RETRY_AFTER, DISCORD_LOGIN_LAST_CF_RAY, DISCORD_LOGIN_LAST_VIA
     global DISCORD_LOGIN_LAST_SERVER, DISCORD_LOGIN_LAST_MESSAGE
 
-    fallback_attempt = 0
     session_recovery_backoff = 30.0
     handover_delay_done = False
 
@@ -2118,10 +2122,8 @@ async def _start_discord_with_rate_limit_retry(discord_token: str) -> None:
             is_library_ratelimited = bool(rate_limited_type) and isinstance(exc, rate_limited_type)
 
             if is_http_429 or is_library_ratelimited:
-                fallback_attempt += 1
                 DISCORD_LOGIN_RETRY_COUNT += 1
-                fallback = min(30.0 * (2 ** max(0, fallback_attempt - 1)), 300.0)
-                wait_seconds, source = _discord_retry_after_seconds(exc, fallback)
+                wait_seconds, source = _discord_retry_after_seconds(exc, 0.0)
                 DISCORD_LOGIN_RETRY_AFTER = wait_seconds
 
                 diag = _discord_http_429_diagnostics(exc)
@@ -2136,15 +2138,22 @@ async def _start_discord_with_rate_limit_retry(discord_token: str) -> None:
                 DISCORD_LOGIN_LAST_SERVER = str(diag.get("server") or "")
                 DISCORD_LOGIN_LAST_MESSAGE = str(diag.get("text") or "")
 
-                DISCORD_LOGIN_STATE = "rate_limited_waiting"
+                try:
+                    _record_discord_outbound_429(
+                        exc,
+                        context="discord-api:GET /users/@me",
+                    )
+                except Exception:
+                    pass
+
+                DISCORD_LOGIN_STATE = "quarantined"
                 log.warning(
-                    "Discord login rate-limited | status=%s | scope=%s | global=%s | retry_after=%.3fs | source=%s | retry_count=%d | keeping service alive",
+                    "Discord login rate-limited | status=%s | scope=%s | global=%s | retry_after=%.3fs | source=%s | quarantine=yes | no retry",
                     getattr(exc, "status", 429),
                     scope,
                     global_header,
                     wait_seconds,
                     source,
-                    DISCORD_LOGIN_RETRY_COUNT,
                 )
 
                 log.warning(
@@ -2159,23 +2168,11 @@ async def _start_discord_with_rate_limit_retry(discord_token: str) -> None:
                     diag.get("text") or "-",
                 )
 
-                # Respect Retry-After and rebuild the HTTPClient object locally.
-                # The previous v1.0.22 flow closed bot.http and reused the same
-                # HTTPClient object, which produced a persistent Session is closed
-                # loop when the cooldown expired. Rebuilding the object sends no HTTP.
-                await _rebuild_discord_http_client("http-429")
-                await _reset_discord_client_state_after_login_error("http-429-httpclient-rebuild")
-                try:
-                    await asyncio.wait_for(DISCORD_SHUTDOWN_EVENT.wait(), timeout=wait_seconds)
-                    DISCORD_LOGIN_STATE = "shutdown_requested"
-                    DISCORD_LOGIN_RETRY_AFTER = 0.0
-                    return
-                except asyncio.TimeoutError:
-                    pass
-
-                DISCORD_LOGIN_STATE = "retrying"
-                DISCORD_LOGIN_RETRY_AFTER = 0.0
-                continue
+                # Retry-After is recorded for telemetry and quarantine only.
+                # Do not rebuild the HTTP client, do not wait, and do not retry
+                # from the same process after Discord has returned HTTP 429.
+                DISCORD_LOGIN_RETRY_AFTER = wait_seconds
+                return
 
             if isinstance(exc, RuntimeError) and "Session is closed" in str(exc):
                 DISCORD_LOGIN_SESSION_RECOVERY_COUNT += 1
