@@ -9,6 +9,7 @@ import time
 import subprocess
 import sys
 import signal
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MethodType
 
@@ -21,7 +22,7 @@ from discord import app_commands
 BASE_DIR = Path(__file__).resolve().parent
 DICTIONARY_PATH = BASE_DIR / "dictionary.json"
 INDEX_PATH = BASE_DIR / "index.html"
-JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.28")
+JAVIS_VERSION = os.getenv("JAVIS_VERSION", "1.0.29")
 
 # Translation-room configuration. JAVIS translates messages ONLY in channels
 # explicitly enabled with /setroom. The configuration is per Discord guild.
@@ -779,6 +780,7 @@ DISCORD_QUARANTINED = False
 DISCORD_QUARANTINE_CONTEXT = ""
 DISCORD_QUARANTINE_RETRY_AFTER = 0.0
 DISCORD_QUARANTINE_CF_RAY = ""
+DISCORD_QUARANTINE_UNBLOCK_AT_UTC = "-"
 
 # Render zero-downtime deploys start a new instance before SIGTERM-ing the old one.
 # Delay only the FIRST Discord login attempt so the old Gateway has time to hand over.
@@ -803,6 +805,7 @@ DISCORD_LOGIN_LAST_MESSAGE = ""
 # the process-local gate using Retry-After and permanently blocks further Discord
 # HTTP attempts for this process, so the same blocked source is never retried.
 DISCORD_OUTBOUND_BLOCKED_UNTIL_MONO = 0.0
+DISCORD_OUTBOUND_BLOCKED_UNTIL_UTC = "-"
 DISCORD_OUTBOUND_LAST_429_RETRY_AFTER = 0.0
 DISCORD_OUTBOUND_LAST_429_CONTEXT = ""
 DISCORD_OUTBOUND_LAST_CF_RAY = ""
@@ -1005,6 +1008,7 @@ async def health(request: web.Request) -> web.Response:
             "discord_quarantine_context": DISCORD_QUARANTINE_CONTEXT,
             "discord_quarantine_retry_after": DISCORD_QUARANTINE_RETRY_AFTER,
             "discord_quarantine_cf_ray": DISCORD_QUARANTINE_CF_RAY,
+            "discord_quarantine_unblock_at_utc": DISCORD_QUARANTINE_UNBLOCK_AT_UTC,
             "discord_startup_handover_delay_seconds": DISCORD_STARTUP_HANDOVER_DELAY_SECONDS,
             "discord_shutdown_requested": DISCORD_SHUTDOWN_REQUESTED,
             "discord_login_last_status": DISCORD_LOGIN_LAST_STATUS,
@@ -1019,6 +1023,7 @@ async def health(request: web.Request) -> web.Response:
             "discord_outbound_last_429_retry_after": DISCORD_OUTBOUND_LAST_429_RETRY_AFTER,
             "discord_outbound_last_429_context": DISCORD_OUTBOUND_LAST_429_CONTEXT,
             "discord_outbound_last_429_cf_ray": DISCORD_OUTBOUND_LAST_CF_RAY,
+            "discord_outbound_blocked_until_utc": DISCORD_OUTBOUND_BLOCKED_UNTIL_UTC,
             "render_service": RENDER_SERVICE,
             "render_region": RENDER_REGION,
             "outbound_ip": OUTBOUND_IP,
@@ -1591,22 +1596,27 @@ def _enter_discord_429_quarantine(*, retry_after: float, context: str, cf_ray: s
     """Hard-stop further Discord HTTP attempts in this process after a 429."""
     global DISCORD_QUARANTINED
     global DISCORD_QUARANTINE_CONTEXT, DISCORD_QUARANTINE_RETRY_AFTER, DISCORD_QUARANTINE_CF_RAY
+    global DISCORD_QUARANTINE_UNBLOCK_AT_UTC
 
     DISCORD_QUARANTINED = True
     DISCORD_QUARANTINE_CONTEXT = str(context or "-")[:500]
     DISCORD_QUARANTINE_RETRY_AFTER = max(0.0, float(retry_after or 0.0))
     DISCORD_QUARANTINE_CF_RAY = str(cf_ray or "-")[:200]
+    DISCORD_QUARANTINE_UNBLOCK_AT_UTC = (
+        datetime.now(timezone.utc) + timedelta(seconds=DISCORD_QUARANTINE_RETRY_AFTER)
+    ).isoformat().replace("+00:00", "Z")
     log.warning(
-        "Discord 429 quarantine engaged | context=%s | retry_after=%.3fs | cf_ray=%s | no further Discord HTTP requests will be attempted by this process",
+        "Discord 429 quarantine engaged | context=%s | retry_after=%.3fs | unblock_at_utc=%s | cf_ray=%s | no further Discord HTTP requests will be attempted by this process",
         DISCORD_QUARANTINE_CONTEXT,
         DISCORD_QUARANTINE_RETRY_AFTER,
+        DISCORD_QUARANTINE_UNBLOCK_AT_UTC,
         DISCORD_QUARANTINE_CF_RAY or "-",
     )
 
 
 def _record_discord_outbound_429(exc: Exception, *, context: str) -> float:
     """Arm the outbound cooldown using Discord's Retry-After metadata."""
-    global DISCORD_OUTBOUND_BLOCKED_UNTIL_MONO
+    global DISCORD_OUTBOUND_BLOCKED_UNTIL_MONO, DISCORD_OUTBOUND_BLOCKED_UNTIL_UTC
     global DISCORD_OUTBOUND_LAST_429_RETRY_AFTER, DISCORD_OUTBOUND_LAST_429_CONTEXT
     global DISCORD_OUTBOUND_LAST_CF_RAY
 
@@ -1638,13 +1648,18 @@ def _record_discord_outbound_429(exc: Exception, *, context: str) -> float:
         DISCORD_OUTBOUND_BLOCKED_UNTIL_MONO,
         time.monotonic() + retry_after,
     )
+    blocked_for_seconds = max(0.0, DISCORD_OUTBOUND_BLOCKED_UNTIL_MONO - time.monotonic())
+    DISCORD_OUTBOUND_BLOCKED_UNTIL_UTC = (
+        datetime.now(timezone.utc) + timedelta(seconds=blocked_for_seconds)
+    ).isoformat().replace("+00:00", "Z")
     DISCORD_OUTBOUND_LAST_429_RETRY_AFTER = retry_after
     DISCORD_OUTBOUND_LAST_429_CONTEXT = context
     DISCORD_OUTBOUND_LAST_CF_RAY = cf_ray
     log.warning(
-        "Discord outbound REST cooldown armed | context=%s | retry_after=%.3fs | cf_ray=%s | no fallback HTTP will be sent",
+        "Discord outbound REST cooldown armed | context=%s | retry_after=%.3fs | unblock_at_utc=%s | cf_ray=%s | no fallback HTTP will be sent",
         context,
         retry_after,
+        DISCORD_OUTBOUND_BLOCKED_UNTIL_UTC,
         cf_ray or "-",
     )
     _enter_discord_429_quarantine(
@@ -2169,9 +2184,19 @@ async def _start_discord_with_rate_limit_retry(discord_token: str) -> None:
                 )
 
                 # Retry-After is recorded for telemetry and quarantine only.
-                # Do not rebuild the HTTP client, do not wait, and do not retry
-                # from the same process after Discord has returned HTTP 429.
+                # Do not rebuild the HTTP client and do not retry from the same process
+                # after Discord has returned HTTP 429. Keep this Render process alive
+                # in quarantine so main() does not exit and trigger an automatic restart,
+                # which would otherwise re-send GET /users/@me from the same blocked IP.
                 DISCORD_LOGIN_RETRY_AFTER = wait_seconds
+                log.warning(
+                    "Discord quarantine hold active | unblock_at_utc=%s | retry_after=%.3fs | process will stay alive | no retry",
+                    DISCORD_QUARANTINE_UNBLOCK_AT_UTC,
+                    wait_seconds,
+                )
+                await DISCORD_SHUTDOWN_EVENT.wait()
+                DISCORD_LOGIN_STATE = "shutdown_requested"
+                DISCORD_LOGIN_RETRY_AFTER = 0.0
                 return
 
             if isinstance(exc, RuntimeError) and "Session is closed" in str(exc):

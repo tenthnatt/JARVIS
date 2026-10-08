@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>JAVIS — TWOM Translator v1.0.28</title>
+  <title>JAVIS — TWOM Translator v1.0.29</title>
   <style>
     :root { color-scheme: dark; }
     body { margin:0; font-family:system-ui,-apple-system,Segoe UI,sans-serif; background:#0f1115; color:#f3f4f6; }
@@ -28,7 +28,7 @@
   <h1>JAVIS — TWOM Auto Translator</h1>
   <p id="message">กำลังตรวจสอบสถานะบริการ...</p>
   <div class="grid">
-    <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.28</div></div>
+    <div class="item"><div class="label">Version</div><div id="version" class="value">v1.0.29</div></div>
     <div class="item"><div class="label">Languages</div><div class="value">TH → EN + KO<br>EN → TH + KO<br>KO → EN + TH</div></div>
     <div class="item"><div class="label">Engine</div><div class="value">Argos + CTranslate2</div></div>
     <div class="item"><div class="label">Runtime Quantization</div><div id="compute" class="value">Checking...</div></div>
@@ -47,6 +47,7 @@
     <div class="item"><div class="label">Retry After</div><div id="retryafter" class="value">Checking...</div></div>
     <div class="item"><div class="label">Outbound REST Cooldown</div><div id="outboundcooldown" class="value">Checking...</div></div>
     <div class="item"><div class="label">Discord 429 Quarantine</div><div id="quarantine" class="value">Checking...</div></div>
+    <div class="item"><div class="label">429 Unblock Time (UTC)</div><div id="quarantineUnblock" class="value small">Checking...</div></div>
     <div class="item"><div class="label">Last Outbound 429</div><div id="outboundcontext" class="value">Checking...</div></div>
     <div class="item"><div class="label">Startup Handover</div><div id="handover" class="value">Checking...</div></div>
     <div class="item"><div class="label">Last 429 Scope</div><div id="lastscope" class="value">Checking...</div></div>
@@ -79,7 +80,7 @@
     <div class="item"><div class="label">Decode</div><div id="decode" class="value">Checking...</div></div>
     <div class="item"><div class="label">Response</div><div id="responsemode" class="value">Checking...</div></div>
     <div class="item"><div class="label">Runtime Settings</div><div class="value small">ARGOS_COMPUTE_TYPE=int8 · CPU · Batch=1 enforced</div></div>
-    <div class="item"><div class="label">Discord Telemetry</div><div class="value small">Request metadata only · token/body never logged · 429 shared is excluded from INVALID_REQUEST_COUNT · 429 quarantine stops further Discord HTTP retries</div></div>
+    <div class="item"><div class="label">Discord Telemetry</div><div class="value small">Request metadata only · token/body never logged · 429 shared is excluded from INVALID_REQUEST_COUNT · 429 quarantine stops further Discord HTTP retries; unblock time is telemetry-only and does not auto-retry</div></div>
   </div>
 </section>
 </main>
@@ -113,6 +114,7 @@ async function refreshStatus() {
     document.getElementById('retryafter').textContent=`${Number(d.discord_login_retry_after || 0).toFixed(1)}s`;
     document.getElementById('outboundcooldown').textContent=`${Number(d.discord_outbound_block_retry_after || 0).toFixed(1)}s`;
     document.getElementById('quarantine').textContent=d.discord_quarantined ? `ACTIVE · ${d.discord_quarantine_context || '429'} · no retry` : 'none';
+    if(document.getElementById('quarantineUnblock')) document.getElementById('quarantineUnblock').textContent=d.discord_quarantine_unblock_at_utc || d.discord_outbound_blocked_until_utc || '-';
     document.getElementById('outboundcontext').textContent=d.discord_outbound_last_429_context || 'none';
     document.getElementById('handover').textContent=`${Number(d.discord_startup_handover_delay_seconds || 0).toFixed(0)}s first-login hold`;
     document.getElementById('lastscope').textContent=d.discord_login_last_scope || 'unknown';
@@ -138,7 +140,8 @@ async function refreshStatus() {
     } else {
       badge.textContent='● CONFIGURATION / WORKER CHECK'; badge.className='ok warn';
       if(d.discord_login_state === 'quarantined'){
-        message.textContent = `Discord API ตอบ 429 — JAVIS อ่าน Retry-After, บันทึก telemetry และเข้าสู่ quarantine แล้ว โดยจะไม่ retry Discord HTTP จาก process นี้`;
+        const unblockAt = d.discord_quarantine_unblock_at_utc || d.discord_outbound_blocked_until_utc || '-';
+        message.textContent = `Discord API ตอบ 429 — JAVIS อ่าน Retry-After, บันทึก telemetry และเข้าสู่ quarantine แล้ว · กำหนดปลดบล็อคจาก Retry-After: ${unblockAt} · process นี้จะไม่ retry อัตโนมัติ`;
       } else if(d.discord_login_state === 'rate_limited_waiting' || d.discord_login_state === 'retrying' || d.discord_login_state === 'handover_waiting'){
         const wait = Number(d.discord_login_retry_after || 0);
         if(d.discord_login_state === 'handover_waiting'){
